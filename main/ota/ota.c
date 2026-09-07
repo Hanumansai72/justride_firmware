@@ -8,11 +8,9 @@
 #include "esp_app_format.h"
 
 // JustRide modules
-#include "battery.h"
+#include "display.h"
 
 static const char *TAG = "OTA";
-
-#define OTA_MIN_BATTERY_PERCENTAGE  30
 
 static ota_status_t s_ota_status = OTA_STATUS_IDLE;
 static esp_ota_handle_t s_ota_handle = 0;
@@ -23,23 +21,18 @@ static uint32_t s_received_bytes = 0;
 
 void ota_init(void)
 {
-    ESP_LOGI(TAG, "Initializing JustRide OTA Subsystem...");
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    ESP_LOGI(TAG, "Running firmware partition: '%s' (addr: 0x%08" PRIx32 ", size: %" PRIu32 " KB)",
+             running ? running->label : "UNKNOWN",
+             running ? running->address : 0,
+             running ? running->size / 1024 : 0);
 
-    s_running_partition = esp_ota_get_running_partition();
-    if (s_running_partition) {
-        ESP_LOGI(TAG, "Currently running partition: '%s' at offset 0x%08" PRIx32 " (Size: %" PRIu32 " KB)",
-                 s_running_partition->label,
-                 s_running_partition->address,
-                 s_running_partition->size / 1024);
-    }
-
-    esp_ota_img_states_t ota_state;
-    if (esp_ota_get_state_partition(s_running_partition, &ota_state) == ESP_OK) {
-        if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
-            ESP_LOGW(TAG, "Running firmware is pending validation (fresh OTA boot)!");
-        } else if (ota_state == ESP_OTA_IMG_VALID) {
-            ESP_LOGI(TAG, "Running firmware confirmed as VALID.");
-        }
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    if (app_desc) {
+        ESP_LOGI(TAG, "Current firmware version : %s", app_desc->version);
+        ESP_LOGI(TAG, "Project name             : %s", app_desc->project_name);
+        ESP_LOGI(TAG, "Build time               : %s %s", app_desc->date, app_desc->time);
+        ESP_LOGI(TAG, "IDF version              : %s", app_desc->idf_ver);
     }
 
     s_ota_status = OTA_STATUS_IDLE;
@@ -49,10 +42,7 @@ esp_err_t ota_start(uint32_t image_size)
 {
     ESP_LOGI(TAG, "OTA Start requested. Total size: %" PRIu32 " bytes", image_size);
 
-    // 1. Hardware Battery Level Safety Check
-    int batt_pct = battery_get_percentage();
-
-    // 2. Identify the inactive target partition
+    // 1. Identify the inactive target partition
     s_running_partition = esp_ota_get_running_partition();
     s_update_partition = esp_ota_get_next_update_partition(NULL);
 
@@ -77,6 +67,10 @@ esp_err_t ota_start(uint32_t image_size)
     s_received_bytes = 0;
     s_ota_status = OTA_STATUS_READY;
 
+    // Show the OTA updating screen immediately so the user knows
+    // firmware is being written (works for both USB flash and BLE OTA)
+    display_show_ota_screen(0);
+
     ESP_LOGI(TAG, "OTA partition ready. Awaiting binary data chunks...");
     return ESP_OK;
 }
@@ -100,6 +94,11 @@ esp_err_t ota_write_chunk(uint32_t offset, const uint8_t *data, uint16_t length)
     }
 
     s_received_bytes += length;
+
+    // NOTE: display_show_ota_screen() is intentionally NOT called here.
+    // ble_ota_data_access() in ble.c already throttles display updates at 2% increments.
+    // Calling it here too would cause double full-screen redraws and visible OTA screen flicker.
+
     return ESP_OK;
 }
 
@@ -157,8 +156,17 @@ ota_status_t ota_get_status(void)
 
 void ota_confirm_boot_valid(void)
 {
+    // Always fetch a fresh running-partition pointer.
+    // s_running_partition is only set inside ota_start(), so at cold boot (no OTA session yet)
+    // it is NULL — passing NULL to esp_ota_get_state_partition() would crash or return NOT_FOUND.
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (!running) {
+        ESP_LOGW(TAG, "ota_confirm_boot_valid: running partition not found, skipping.");
+        return;
+    }
+
     esp_ota_img_states_t ota_state;
-    if (esp_ota_get_state_partition(s_running_partition, &ota_state) == ESP_OK) {
+    if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
         if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
             ESP_LOGI(TAG, "Self-tests passed! Confirming firmware valid (cancelling rollback)...");
             esp_ota_mark_app_valid_cancel_rollback();

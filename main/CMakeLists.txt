@@ -1,2 +1,17 @@
 idf_component_register(SRCS "main.c"
-                       INCLUDE_DIRS ".")
+                            "ota/ota.c"
+                            "battery/battery.c"
+                            "display/display.c"
+                            "display/display_tft.c"
+                            "display/touch.c"
+                            "ble/ble.c"
+                            "time/rtc_time.c"
+                            "buttons/buttons.c"
+                       INCLUDE_DIRS "."
+                                    "ota"
+                                    "battery"
+                                    "display"
+                                    "ble"
+                                    "time"
+                                    "buttons"
+                       REQUIRES driver nvs_flash bt esp_adc app_update esp_timer)
