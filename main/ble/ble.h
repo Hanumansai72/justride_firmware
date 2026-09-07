@@ -39,11 +39,17 @@ void ble_disconnect_and_restart(void);
 #define NAV_STATUS_DEVICE_READY   0x01
 #define NAV_STATUS_RESUME_ROUTE   0x05
 #define NAV_STATUS_CANCEL_ROUTE   0x06
+#define NAV_STATUS_DIAGNOSTICS    0x10
 
 /**
  * @brief Notify phone of device status or button trigger over BLE 0xFF32
  */
 void ble_nav_notify_status(uint8_t status_code);
+
+/**
+ * @brief Notify phone of diagnostic payload over BLE 0xFF32
+ */
+void ble_nav_notify_diagnostic_packet(const uint8_t *data, uint16_t len);
 
 #ifdef __cplusplus
 }

@@ -153,6 +153,9 @@ void app_main(void)
     // --------------------------------------------------
     display_init();
 
+    // Show high-contrast boot splash screen (MADE FOR BIKES) and transition to HUD
+    display_show_splash();
+
     // --------------------------------------------------
     // STEP 3: Real-Time Clock Engine
     // --------------------------------------------------
@@ -162,9 +165,6 @@ void app_main(void)
     // STEP 4: Physical Push-buttons
     // --------------------------------------------------
     buttons_init();
-
-    // Show 2-second high-contrast boot splash and transition to HUD
-    display_show_splash();
 
     // --------------------------------------------------
     // STEP 5: BLE Stack & Real-Time Sync

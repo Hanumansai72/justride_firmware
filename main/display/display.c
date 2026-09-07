@@ -13,7 +13,7 @@
 static const char *TAG = "DISPLAY";
 
 static bool s_is_initialized = false;
-static screen_id_t s_current_screen = SCREEN_HOME;
+static screen_id_t s_current_screen = SCREEN_COUNT; // Initialize to SCREEN_COUNT during boot/splash
 static SemaphoreHandle_t s_display_mutex = NULL;
 
 // Dynamic brightness state (0-100%)
@@ -297,56 +297,71 @@ static void render_status_bar(void) {
 void display_show_splash(void) {
     if (!s_is_initialized) display_init();
 
-    ESP_LOGI(TAG, "Rendering animated JustRide Splash Screen...");
+    ESP_LOGI(TAG, "Rendering JustRide Motorcycle Splash Screen (MADE FOR BIKES)...");
 
-    // Hold nav_render_task at bay: SCREEN_COUNT is not SCREEN_NAV so the
-    // task skips rendering while splash is drawn on screen.
+    // Acquire display mutex to lock out all background tasks during splash animation
+    if (s_display_mutex) {
+        xSemaphoreTake(s_display_mutex, portMAX_DELAY);
+    }
+
+    // Hold background rendering tasks at bay
     s_current_screen = SCREEN_COUNT;
 
+    // 1. Clean screen canvas
     tft_fill_screen(COLOR_BLACK);
 
-    // Frame 1: Expanding Border Accent Animation
-    for (int step = 0; step <= 8; step += 2) {
-        tft_draw_rect(step, step, DISPLAY_WIDTH - (step * 2), DISPLAY_HEIGHT - (step * 2), COLOR_DARKGREY);
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
+    // 2. High-contrast double border frame
     tft_draw_rect(6, 6, DISPLAY_WIDTH - 12, DISPLAY_HEIGHT - 12, COLOR_WHITE);
+    tft_draw_rect(8, 8, DISPLAY_WIDTH - 16, DISPLAY_HEIGHT - 16, COLOR_DARKGREY);
 
-    // Frame 2: Modern Motorcycle HUD Brand Reveal
-    tft_fill_circle(DISPLAY_WIDTH / 2, 45, 14, COLOR_WHITE);
-    tft_fill_circle(DISPLAY_WIDTH / 2, 45, 11, COLOR_BLACK);
-    tft_fill_triangle(DISPLAY_WIDTH / 2, 38, DISPLAY_WIDTH / 2 - 6, 50, DISPLAY_WIDTH / 2 + 6, 50, COLOR_WHITE);
+    // 3. JustRide Helmet / HUD Chevron Icon
+    tft_fill_circle(DISPLAY_WIDTH / 2, 40, 14, COLOR_WHITE);
+    tft_fill_circle(DISPLAY_WIDTH / 2, 40, 11, COLOR_BLACK);
+    tft_fill_triangle(DISPLAY_WIDTH / 2, 33, DISPLAY_WIDTH / 2 - 6, 45, DISPLAY_WIDTH / 2 + 6, 45, COLOR_WHITE);
 
-    tft_draw_string_centered(DISPLAY_WIDTH / 2, 70, "JUST RIDE", COLOR_WHITE, COLOR_BLACK, 3);
-    tft_draw_fast_h_line(40, 104, 240, COLOR_WHITE);
+    // 4. Main Brand Header
+    tft_draw_string_centered(DISPLAY_WIDTH / 2, 64, "JUST RIDE", COLOR_WHITE, COLOR_BLACK, 3);
+    tft_draw_fast_h_line(50, 96, 220, COLOR_WHITE);
 
-    tft_draw_string_centered(DISPLAY_WIDTH / 2, 114, "CONNECTED COCKPIT HUD", COLOR_WHITE, COLOR_BLACK, 1);
-    tft_draw_string_centered(DISPLAY_WIDTH / 2, 134, "ESP32 SMART SYSTEM", COLOR_LIGHTGREY, COLOR_BLACK, 1);
+    // 5. Official Motorcycle Tagline
+    tft_draw_string_centered(DISPLAY_WIDTH / 2, 106, "MADE FOR BIKES", COLOR_WHITE, COLOR_BLACK, 2);
+    tft_draw_string_centered(DISPLAY_WIDTH / 2, 128, "CONNECTED COCKPIT HUD", COLOR_LIGHTGREY, COLOR_BLACK, 1);
 
-    // Frame 3: Booting Progress Bar
+    // 6. Progress Bar Architecture (Pre-rendered before turning on backlight)
     const int bar_x = 45;
-    const int bar_y = 175;
+    const int bar_y = 158;
     const int bar_w = 230;
     const int bar_h = 10;
-    tft_draw_rect(bar_x - 2, bar_y - 2, bar_w + 4, bar_h + 4, COLOR_DARKGREY);
+    tft_draw_rect(bar_x - 2, bar_y - 2, bar_w + 4, bar_h + 4, COLOR_WHITE);
+    tft_fill_rect(bar_x, bar_y, bar_w, bar_h, COLOR_BLACK);
 
-    // The controller and complete first splash frame are ready before the
-    // panel is lit.  On a software/BLE restart this prevents reset garbage or
-    // half-drawn frames from being visible.
+    // Pre-draw initial 0% status string
+    tft_draw_string_centered(DISPLAY_WIDTH / 2, 180, "LOADING SYSTEM   0%", COLOR_LIGHTGREY, COLOR_BLACK, 1);
+
+    // Raise backlight cleanly now that full splash frame is rendered (zero glitch/noise)
     tft_set_backlight(s_brightness_pct);
 
-    for (int p = 0; p <= 100; p += 10) {
+    // 7. Smooth, glitch-free progress bar animation
+    for (int p = 5; p <= 100; p += 5) {
         int fill = (p * bar_w) / 100;
         if (fill > 0) {
             tft_fill_rect(bar_x, bar_y, fill, bar_h, COLOR_WHITE);
         }
-        char prog_str[16];
-        snprintf(prog_str, sizeof(prog_str), "BOOTING %3d%%", p);
-        tft_draw_string_centered(DISPLAY_WIDTH / 2, 198, prog_str, COLOR_LIGHTGREY, COLOR_BLACK, 1);
-        vTaskDelay(pdMS_TO_TICKS(25));
+        char prog_str[24];
+        snprintf(prog_str, sizeof(prog_str), "LOADING SYSTEM %3d%%", p);
+        // Clear text box first to prevent character ghosting / tearing
+        tft_fill_rect(DISPLAY_WIDTH / 2 - 80, 178, 160, 12, COLOR_BLACK);
+        tft_draw_string_centered(DISPLAY_WIDTH / 2, 180, prog_str, COLOR_LIGHTGREY, COLOR_BLACK, 1);
+        vTaskDelay(pdMS_TO_TICKS(35));
     }
 
-    vTaskDelay(pdMS_TO_TICKS(200));
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    // Release mutex before switching screen
+    if (s_display_mutex) {
+        xSemaphoreGive(s_display_mutex);
+    }
+
     display_set_screen(SCREEN_HOME);
 }
 
@@ -1951,7 +1966,7 @@ void display_set_time(uint8_t hours, uint8_t minutes) {
     if (minutes > 59) minutes = 59;
     s_time_hours = hours;
     s_time_minutes = minutes;
-    if (s_is_initialized) {
+    if (s_is_initialized && s_current_screen != SCREEN_COUNT) {
         if (s_display_mutex && xSemaphoreTake(s_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             render_status_bar();
             if (s_current_screen == SCREEN_HOME) {
@@ -1975,7 +1990,7 @@ void display_set_ble_status(bool connected) {
         display_show_resume_route_modal();
     }
     
-    if (s_is_initialized) {
+    if (s_is_initialized && s_current_screen != SCREEN_COUNT) {
         if (s_display_mutex && xSemaphoreTake(s_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             render_status_bar();
             xSemaphoreGive(s_display_mutex);
@@ -2114,7 +2129,7 @@ nav_camera_mode_t display_nav_get_camera_mode(void) {
 // =============================================================================
 
 static void notif_auto_dismiss_timer_cb(TimerHandle_t xTimer) {
-    ESP_LOGI(TAG, "Notification auto-dismiss timer fired (4s)");
+    ESP_LOGI(TAG, "Notification auto-dismiss timer fired (2s)");
     display_dismiss_notification();
 }
 
@@ -2143,9 +2158,9 @@ void display_show_notification(const char *title, const char *message) {
         xSemaphoreGive(s_display_mutex);
     }
 
-    // Start or reset 4-second auto-dismiss timer
+    // Start or reset 2-second auto-dismiss timer
     if (!s_notif_timer) {
-        s_notif_timer = xTimerCreate("notif_timer", pdMS_TO_TICKS(4000), pdFALSE, NULL, notif_auto_dismiss_timer_cb);
+        s_notif_timer = xTimerCreate("notif_timer", pdMS_TO_TICKS(2000), pdFALSE, NULL, notif_auto_dismiss_timer_cb);
     }
     if (s_notif_timer) {
         xTimerStop(s_notif_timer, 0);

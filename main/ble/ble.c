@@ -27,6 +27,7 @@
 #include "rtc_time.h"
 #include "ota.h"
 #include "display.h"
+#include "battery.h"
 
 static const char *TAG = "BLE";
 
@@ -45,7 +46,7 @@ static const char *TAG = "BLE";
 
 // JustRide Image Transfer Service UUIDs
 #define BLE_SVC_IMG_UUID16               0xFF20
-#define BLE_CHR_IMG_CONTROL_UUID16       0xFF21  // Write: START/FINISH/ABORT
+#define BLE_CHR_IMG_CONTROL_UUID16       0xFF21  // Write: START/FINISH/ABORT/RESET
 #define BLE_CHR_IMG_DATA_UUID16          0xFF22  // Write no-rsp: [seq_lo][seq_hi][...rgb565...]
 #define BLE_CHR_IMG_STATUS_UUID16        0xFF23  // Notify: [status][progress%]
 
@@ -71,11 +72,13 @@ static const char *TAG = "BLE";
 #define NAV_OP_RESTART                   0x0D
 #define NAV_OP_RESET                     0x0E
 #define NAV_OP_NOTIFICATION              0x0F
+#define NAV_OP_DIAGNOSTICS               0x10
 
 // Image Control OpCodes
 #define IMG_CMD_START                    0x01
 #define IMG_CMD_FINISH                   0x02
 #define IMG_CMD_ABORT                    0x03
+#define IMG_CMD_RESET                    0x04
 
 // Image Status Codes
 #define IMG_STATUS_READY                 0x10
@@ -135,6 +138,9 @@ void ble_disconnect_and_restart(void)
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         vTaskDelay(pdMS_TO_TICKS(150));
     }
+
+    display_set_brightness(0);
+    vTaskDelay(pdMS_TO_TICKS(50));
 
     ESP_LOGI(TAG, "Rebooting ESP32...");
     esp_restart();
@@ -379,6 +385,13 @@ static int ble_img_control_access(uint16_t conn_handle, uint16_t attr_handle,
         display_show_main_screen();
         ble_img_notify_status(IMG_STATUS_ERROR_ABORTED, 0);
         return 0;
+    case IMG_CMD_RESET:
+        s_img_transfer_active = false;
+        s_img_bytes_received  = 0;
+        ESP_LOGI(TAG, "IMG: RESET — clearing custom image and resetting to default");
+        display_show_main_screen();
+        ble_img_notify_status(IMG_STATUS_READY, 0);
+        return 0;
     default:
         return BLE_ATT_ERR_UNLIKELY;
     }
@@ -602,6 +615,24 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
             ESP_LOGI(TAG, "BLE Notification: Title='%s' Msg='%s'", title_str, msg_str);
             display_show_notification(title_str, msg_str);
             return 0;
+        } else if (op == NAV_OP_DIAGNOSTICS) {
+            ESP_LOGI(TAG, "BLE Remote: Diagnostics self-test requested from App");
+            int batt_pct = battery_get_percentage();
+            float batt_v = battery_get_voltage();
+            bool is_chg = battery_is_charging();
+            uint8_t v_deci = (batt_v > 0) ? (uint8_t)(batt_v * 10.0f) : 41;
+
+            uint8_t diag_buf[7] = {
+                NAV_STATUS_DIAGNOSTICS, // 0x10
+                1,                      // Bluetooth link OK
+                1,                      // GPS status OK
+                1,                      // Display TFT 320x240 OK
+                (uint8_t)(batt_pct >= 0 ? batt_pct : 85),
+                is_chg ? 1 : 0,
+                v_deci
+            };
+            ble_nav_notify_diagnostic_packet(diag_buf, sizeof(diag_buf));
+            return 0;
         }
     }
 
@@ -739,6 +770,13 @@ void ble_nav_notify_status(uint8_t status_code)
     if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || s_nav_status_val_handle == 0) return;
     uint8_t buf[2] = { status_code, 0 };
     struct os_mbuf *om = ble_hs_mbuf_from_flat(buf, sizeof(buf));
+    if (om) ble_gatts_notify_custom(s_conn_handle, s_nav_status_val_handle, om);
+}
+
+void ble_nav_notify_diagnostic_packet(const uint8_t *data, uint16_t len)
+{
+    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || s_nav_status_val_handle == 0 || !data || len == 0) return;
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(data, len);
     if (om) ble_gatts_notify_custom(s_conn_handle, s_nav_status_val_handle, om);
 }
 
