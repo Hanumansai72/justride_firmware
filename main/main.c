@@ -162,16 +162,29 @@ void app_main(void)
     // --------------------------------------------------
     // STEP 3: Real-Time Clock Engine
     // --------------------------------------------------
-    time_init();
+    ESP_ERROR_CHECK(time_init());
 
     // --------------------------------------------------
     // STEP 4: Physical Push-buttons
     // --------------------------------------------------
-    buttons_init();
+    ESP_ERROR_CHECK(buttons_init());
 
     // --------------------------------------------------
     // STEP 5: BLE Stack & Real-Time Sync
     // --------------------------------------------------
+    // Initial HUD state: Ready for Ride / Awaiting Google Navigation over BLE
+    navigation_data_t initial_nav = {
+        .direction = NAV_DIR_STRAIGHT,
+        .distance_meters = 0,
+        .current_street = "Ready for Ride",
+        .eta_time_str = "--:--",
+        .remaining_dist_km = 0.0f,
+        .speed_kmh = 0,
+        .is_navigating = false,
+    };
+    display_update_navigation(&initial_nav);
+
+
     ble_init();
 
     // --------------------------------------------------
@@ -187,19 +200,8 @@ void app_main(void)
     }
 
     // Launch background touch input monitoring task
-    xTaskCreate(touch_task, "touch_task", 3072, NULL, 5, NULL);
-
-    // Initial HUD state: Ready for Ride / Awaiting Google Navigation over BLE
-    navigation_data_t initial_nav = {
-        .direction = NAV_DIR_STRAIGHT,
-        .distance_meters = 0,
-        .current_street = "Ready for Ride",
-        .eta_time_str = "--:--",
-        .remaining_dist_km = 0.0f,
-        .speed_kmh = 0,
-        .is_navigating = false,
-    };
-    display_update_navigation(&initial_nav);
+    BaseType_t touch_created = xTaskCreate(touch_task, "touch_task", 3072, NULL, 5, NULL);
+    configASSERT(touch_created == pdPASS);
 
     ESP_LOGI(TAG, "All subsystems running. 2.8\" HUD operational.");
 

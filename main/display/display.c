@@ -1,4 +1,8 @@
+#include "map_frame.h"
 #include "display.h"
+#include "freertos/queue.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "ble.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -25,7 +29,8 @@ static uint8_t s_brightness_pct = 80;
 // Dynamic system state
 static uint8_t s_time_hours = 14;
 static uint8_t s_time_minutes = 5;
-static bool s_ble_connected = true;
+static bool s_ble_connected = false;
+static bool s_phone_state_ready = false;
 static uint16_t s_speed_kmh =
     0; // Live vehicle speed (km/h) — 0 when stationary
 
@@ -62,6 +67,7 @@ static notification_info_t s_latest_notif = {
     .active = false,
 };
 static TimerHandle_t s_notif_timer = NULL;
+static volatile bool s_notif_dismiss_requested;
 
 // Gallery / User Image state (Strict SINGLE image support)
 static bool s_user_image_valid = false;
@@ -227,6 +233,63 @@ static nav_hud_cache_t s_hud = {
 };
 
 // Forward declaration of internal refreshers
+static QueueHandle_t s_nav_queue, s_media_queue, s_route_queue, s_context_queue;
+static QueueHandle_t s_connection_queue, s_notification_queue;
+static StaticQueue_t s_connection_queue_storage, s_notification_queue_storage;
+static uint8_t s_connection_queue_bytes[sizeof(bool)];
+static uint8_t s_notification_queue_bytes[sizeof(notification_info_t)];
+static void apply_notification(const char *title, const char *message);
+static StaticQueue_t s_route_queue_storage, s_context_queue_storage;
+static uint8_t s_route_queue_bytes[sizeof(route_segment_t)];
+static uint8_t s_context_queue_bytes[sizeof(nav_context_t)];
+static StaticQueue_t s_nav_queue_storage, s_media_queue_storage;
+static uint8_t s_nav_queue_bytes[sizeof(navigation_data_t)];
+static uint8_t s_media_queue_bytes[sizeof(media_state_t)];
+static media_state_t s_media;
+static bool s_media_dirty = true, s_media_frame = false, s_screen_refresh = false;
+static int64_t s_last_media_command_us;
+static void apply_navigation(const navigation_data_t *nav_data);
+
+void display_update_media(const media_state_t *state) {
+  if (s_media_queue && state) xQueueOverwrite(s_media_queue, state);
+}
+
+static void render_music(void) {
+  if (!s_media_frame) {
+    tft_fill_screen(COLOR_BLACK);
+    tft_draw_string(14, 12, "MUSIC", COLOR_JUST_GREEN, COLOR_BLACK, 2);
+    tft_draw_string(184, 16, "SWIPE FOR NAV", COLOR_LIGHTGREY, COLOR_BLACK, 1);
+    s_media_frame = true;
+    s_media_dirty = true;
+  }
+  if (!s_media_dirty) return;
+  s_media_dirty = false;
+  tft_fill_rect(8, 40, 304, 190, COLOR_BLACK);
+  const char *status = !s_ble_connected ? "PHONE DISCONNECTED" :
+      s_media.state == 0 ? "MEDIA UNSUPPORTED" :
+      s_media.state == 1 ? "ENABLE NOTIFICATION ACCESS" :
+      s_media.state == 2 ? "OPEN A MUSIC APP ON PHONE" :
+      s_media.state == 4 ? "PLAYING" : s_media.state == 3 ? "PAUSED" : "PLAYER READY";
+  tft_draw_string(14, 43, status, COLOR_JUST_GREEN, COLOR_BLACK, 1);
+  char title[25] = {0};
+  snprintf(title, sizeof(title), "%.24s", s_ble_connected ? s_media.title : "");
+  tft_draw_string(14, 65, title, COLOR_WHITE, COLOR_BLACK, 2);
+  tft_draw_string(14, 91, s_ble_connected ? s_media.artist : "", COLOR_LIGHTGREY, COLOR_BLACK, 1);
+  bool active = s_ble_connected && s_media.state >= 3;
+  uint16_t fg = active ? COLOR_JUST_GREEN : COLOR_DARKGREY;
+  for (int x = 10; x < 300; x += 103) tft_draw_round_rect(x, 118, 94, 60, 8, fg);
+  tft_draw_string_centered(57, 140, "PREV", fg, COLOR_BLACK, 2);
+  tft_draw_string_centered(160, 140, s_media.state == 4 ? "PAUSE" : "PLAY", fg, COLOR_BLACK, 2);
+  tft_draw_string_centered(263, 140, "NEXT", fg, COLOR_BLACK, 2);
+  tft_draw_round_rect(10, 187, 94, 43, 6, fg);
+  tft_draw_round_rect(216, 187, 94, 43, 6, fg);
+  tft_draw_string_centered(57, 200, "VOL -", fg, COLOR_BLACK, 2);
+  tft_draw_string_centered(263, 200, "VOL +", fg, COLOR_BLACK, 2);
+  char volume[12];
+  snprintf(volume, sizeof(volume), "%u%%", s_media.volume);
+  tft_draw_string_centered(160, 200, volume, COLOR_WHITE, COLOR_BLACK, 2);
+}
+
 static void display_nav_render_partial(void);
 static void update_brightness_widgets(void);
 static void render_notification_banner(void);
@@ -414,7 +477,7 @@ void display_show_splash(void) {
   // Acquire display mutex to lock out all background tasks during splash
   // animation
   if (s_display_mutex) {
-    xSemaphoreTake(s_display_mutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(s_display_mutex, portMAX_DELAY);
   }
 
   // Hold background rendering tasks at bay
@@ -487,7 +550,7 @@ void display_show_splash(void) {
 
   // Release mutex before switching screen
   if (s_display_mutex) {
-    xSemaphoreGive(s_display_mutex);
+    xSemaphoreGiveRecursive(s_display_mutex);
   }
 
   display_set_screen(SCREEN_HOME);
@@ -753,6 +816,7 @@ static void draw_hud_primary_turn_card(nav_direction_t dir, uint32_t dist_m,
 }
 
 // ── 2. SECONDARY MANEUVER ("Then ^ 2.4 km Continue Straight") (X: 4..118, Y: 104..196)
+static void draw_hud_speed_badge(uint16_t speed_kmh);
 static void draw_hud_secondary_maneuver(nav_direction_t next_dir,
                                         uint32_t next_dist_m,
                                         const char *next_street) {
@@ -764,6 +828,12 @@ static void draw_hud_secondary_maneuver(nav_direction_t next_dir,
   // Dark rounded card with subtle border
   tft_fill_round_rect(sx, sy, sw, sh, 8, COLOR_HUD_PANEL);
   tft_draw_round_rect(sx, sy, sw, sh, 8, COLOR_HUD_BORDER);
+
+  if (next_dir == NAV_DIR_NONE) {
+    tft_draw_string(sx + 10, sy + 20, "NO NEXT TURN", COLOR_MUTED_TEXT, COLOR_HUD_PANEL, 1);
+    draw_hud_speed_badge(s_speed_kmh);
+    return;
+  }
 
   // "Then" prompt
   tft_draw_string(sx + 10, sy + 10, "Then", COLOR_MUTED_TEXT, COLOR_HUD_PANEL,
@@ -834,8 +904,9 @@ static void draw_hud_secondary_maneuver(nav_direction_t next_dir,
   char clean_lbl[18];
   strncpy(clean_lbl, lbl, sizeof(clean_lbl) - 1);
   clean_lbl[sizeof(clean_lbl) - 1] = '\0';
-  tft_draw_string(sx + 10, sy + 68, clean_lbl, COLOR_MUTED_TEXT,
+  tft_draw_string(sx + 10, sy + 54, clean_lbl, COLOR_MUTED_TEXT,
                   COLOR_HUD_PANEL, 1);
+  draw_hud_speed_badge(s_speed_kmh);
 }
 
 // ── 3. FULL-WIDTH BOTTOM INFORMATION BAR (X: 4..316, Y: 202..236) ────────────
@@ -1002,6 +1073,11 @@ static void draw_hud_route_lines(const route_segment_t *seg, bool erase) {
 }
 
 static void draw_hud_road_corridor(nav_direction_t dir, uint32_t dist_m) {
+  if (map_frame_draw(!s_map_drawn)) {
+    s_map_drawn = true;
+    s_route_seg_dirty = false;
+    return;
+  }
   (void)dist_m;
   if (!s_map_drawn || s_drawn_map_zoom != s_zoom_level ||
       s_drawn_route_seg.count < 2 || s_route_seg.count < 2) {
@@ -1050,8 +1126,9 @@ static void draw_hud_road_corridor(nav_direction_t dir, uint32_t dist_m) {
                     COLOR_HUD_PANEL, 1);
   }
   draw_hud_rider_marker(dir);
-  if (!s_nav.gps_available || s_nav.rerouting) {
-    const char *warning = s_nav.gps_available ? "REROUTING" : "GPS LOST";
+  if (!s_ble_connected || !s_phone_state_ready || !s_nav.gps_available || s_nav.rerouting) {
+    const char *warning = !s_ble_connected ? "PHONE OFFLINE" : !s_phone_state_ready ?
+        "SYNCING" : s_nav.gps_available ? "REROUTING" : "GPS LOST";
     tft_fill_rect(132, 7, 92, 18, COLOR_HUD_PANEL);
     tft_draw_string_centered(190, 12, warning, COLOR_WHITE,
                              COLOR_HUD_PANEL, 1);
@@ -1065,51 +1142,21 @@ static void draw_hud_road_corridor(nav_direction_t dir, uint32_t dist_m) {
 
 // ── 6. COMPACT SPEED OVERLAY: leave the right side for the live map.
 static void draw_hud_speed_badge(uint16_t speed_kmh) {
-  tft_fill_round_rect(263, 7, 53, 32, 4, COLOR_HUD_PANEL);
-  char speed[8];
-  snprintf(speed, sizeof(speed), "%u", (unsigned)speed_kmh);
-  tft_draw_string_centered(289, 10, speed, COLOR_WHITE, COLOR_HUD_PANEL, 2);
-  tft_draw_string_centered(289, 27, "km/h", COLOR_MUTED_TEXT,
-                           COLOR_HUD_PANEL, 1);
+  tft_fill_rect(10, 174, 102, 19, COLOR_HUD_PANEL);
+  char speed[18];
+  if (s_ble_connected && s_phone_state_ready && s_nav.gps_available)
+    snprintf(speed, sizeof(speed), "%u km/h", (unsigned)speed_kmh);
+  else snprintf(speed, sizeof(speed), "-- km/h");
+  tft_draw_string(12, 177, speed, COLOR_WHITE, COLOR_HUD_PANEL, 1);
+  const char *status = !s_ble_connected ? "OFFLINE" : !s_phone_state_ready ? "SYNCING" :
+      !s_nav.gps_available ? "GPS LOST" : s_nav.rerouting ? "REROUTING" : map_frame_active() ? map_frame_status() : "Then";
+  tft_fill_rect(12, 114, 98, 9, COLOR_HUD_PANEL);
+  tft_draw_string(14, 114, status, COLOR_MUTED_TEXT, COLOR_HUD_PANEL, 1);
 }
 
 // =============================================================================
 // HELPER: BRIGHTNESS HUD OVERLAY GAUGE
 // =============================================================================
-static void show_brightness_hud(uint8_t pct) {
-  const int box_x = 50;
-  const int box_y = 80;
-  const int box_w = 220;
-  const int box_h = 75;
-
-  // Background Card
-  tft_fill_rect(box_x, box_y, box_w, box_h, COLOR_BLACK);
-  tft_draw_rect(box_x, box_y, box_w, box_h, COLOR_WHITE);
-  tft_draw_rect(box_x + 2, box_y + 2, box_w - 4, box_h - 4, COLOR_DARKGREY);
-
-  // Title / Icon
-  char title_buf[32];
-  snprintf(title_buf, sizeof(title_buf), "BRIGHTNESS  %d%%", pct);
-  tft_draw_string_centered(160, box_y + 16, title_buf, COLOR_WHITE, COLOR_BLACK,
-                           2);
-
-  // Visual Progress Bar Frame
-  const int bar_x = box_x + 20;
-  const int bar_y = box_y + 44;
-  const int bar_w = box_w - 40; // 180px
-  const int bar_h = 14;
-
-  tft_draw_rect(bar_x, bar_y, bar_w, bar_h, COLOR_WHITE);
-  tft_fill_rect(bar_x + 2, bar_y + 2, bar_w - 4, bar_h - 4, COLOR_BLACK);
-
-  int fill_w = (pct * (bar_w - 4)) / 100;
-  if (fill_w > bar_w - 4)
-    fill_w = bar_w - 4;
-  if (fill_w > 0) {
-    tft_fill_rect(bar_x + 2, bar_y + 2, fill_w, bar_h - 4, COLOR_WHITE);
-  }
-}
-
 // =============================================================================
 // HELPER: LATEST NOTIFICATION HUD BANNER OVERLAY (Y: 34 to 88, X: 12 to 308)
 // Displays strictly ONLY the latest incoming notification with auto/tap dismiss
@@ -1185,20 +1232,22 @@ static void render_route_resume_modal(void) {
 
 void display_show_resume_route_modal(void) {
   if (s_display_mutex &&
-      xSemaphoreTake(s_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      xSemaphoreTakeRecursive(s_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     s_show_route_resume_modal = true;
     screen_id_t screen = s_current_screen;
-    xSemaphoreGive(s_display_mutex);
+    xSemaphoreGiveRecursive(s_display_mutex);
+    s_screen_refresh = true;
     display_set_screen(screen);
   }
 }
 
 void display_dismiss_resume_route_modal(void) {
   if (s_display_mutex &&
-      xSemaphoreTake(s_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      xSemaphoreTakeRecursive(s_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     s_show_route_resume_modal = false;
     screen_id_t screen = s_current_screen;
-    xSemaphoreGive(s_display_mutex);
+    xSemaphoreGiveRecursive(s_display_mutex);
+    s_screen_refresh = true;
     display_set_screen(screen);
   }
 }
@@ -1230,6 +1279,8 @@ static void display_nav_render_partial(void) {
     display_show_home_screen();
     return;
   }
+
+  if (s_latest_notif.active || s_show_route_resume_modal) return;
 
   // -------------------------------------------------------------------------
   // 0. ARRIVAL SCREEN (NAV_DIR_REACHED) — Dedicated Arrival State
@@ -1286,7 +1337,7 @@ static void display_nav_render_partial(void) {
                                 s_nav.next_distance_meters, s_nav.next_street);
 
     // 4. Wide live route map and fixed rider marker
-    draw_hud_road_corridor(s_nav.direction, s_nav.distance_meters);
+    draw_hud_road_corridor(NAV_DIR_STRAIGHT, s_nav.distance_meters);
 
     // 5. Compact speed overlay
     draw_hud_speed_badge(s_speed_kmh);
@@ -1325,17 +1376,8 @@ static void display_nav_render_partial(void) {
   // -------------------------------------------------------------------------
   // 3. DYNAMIC ROAD CORRIDOR & TURN ARROW UPDATE
   // -------------------------------------------------------------------------
-  nav_direction_t arrow_dir = s_nav.direction;
-  if (arrow_dir == NAV_DIR_NONE)
-    arrow_dir = NAV_DIR_STRAIGHT;
-
-  // IMU HEADING OVERLAY: When the bike physically turns left or right
-  // beyond the dead-zone threshold, override the displayed arrow direction
-  // to give the rider real-time physical feedback on the HUD.
-  // s_nav.direction (BLE/GPS) is NEVER modified — only the local arrow_dir.
-  if (s_imu_heading_valid && s_imu_arrow_override != NAV_DIR_NONE) {
-    arrow_dir = s_imu_arrow_override;
-  }
+  // The phone sends heading-up geometry. Tilt is not an absolute GPS bearing.
+  nav_direction_t arrow_dir = NAV_DIR_STRAIGHT;
 
   bool marker_changed = (arrow_dir != s_last_marker_dir);
   if (s_route_seg_dirty) {
@@ -1343,7 +1385,7 @@ static void display_nav_render_partial(void) {
     draw_hud_speed_badge(s_speed_kmh);
     s_hud.last_speed = s_speed_kmh;
     s_hud.last_corridor_dist_m = s_nav.distance_meters;
-  } else if (marker_changed) {
+  } else if (marker_changed && !map_frame_active()) {
     draw_hud_rider_marker(arrow_dir);
   }
 
@@ -1471,41 +1513,41 @@ bool display_has_user_image(void) {
   return false;
 }
 
-void display_start_image_stream(void) {
-  if (!s_is_initialized)
-    display_init();
-  s_current_screen = SCREEN_PICTURE;
+bool display_start_image_stream(void) {
+  if (!s_is_initialized) display_init();
+  // Flash erase must not interrupt an active ride or OTA rendering.
+  if (s_nav.is_navigating || s_current_screen == SCREEN_OTA) return false;
   const esp_partition_t *part = get_user_img_partition();
-  if (part) {
-    const size_t image_end = 4096u + USER_IMG_TOTAL_BYTES;
-    const size_t erase_size = (image_end + 4095u) & ~(size_t)4095u;
-    esp_partition_erase_range(part, 0,
-                              erase_size <= part->size ? erase_size : part->size);
-  }
+  const size_t image_end = 4096u + USER_IMG_TOTAL_BYTES;
+  const size_t erase_size = (image_end + 4095u) & ~(size_t)4095u;
+  if (!part || erase_size > part->size ||
+      esp_partition_erase_range(part, 0, erase_size) != ESP_OK) return false;
+  s_user_image_valid = false;
+  s_current_screen = SCREEN_PICTURE;
   s_stream_flash_offset = 4096;
   tft_stream_image_start();
+  return true;
 }
 
-void display_write_image_chunk(const uint8_t *chunk, size_t len) {
-  if (!chunk || len == 0)
-    return;
+bool display_write_image_chunk(const uint8_t *chunk, size_t len) {
+  if (!chunk || !len || (len & 1) || s_stream_flash_offset < 4096 ||
+      len > 4096 + USER_IMG_TOTAL_BYTES - s_stream_flash_offset) return false;
+  const esp_partition_t *part = get_user_img_partition();
+  if (!part || esp_partition_write(part, s_stream_flash_offset, chunk, len) != ESP_OK) return false;
+  s_stream_flash_offset += len;
   tft_stream_image_chunk(chunk, len);
-  const esp_partition_t *part = get_user_img_partition();
-  if (part && s_stream_flash_offset + len <= part->size) {
-    esp_partition_write(part, s_stream_flash_offset, chunk, len);
-    s_stream_flash_offset += len;
-  }
+  return true;
 }
 
-void display_finish_image_stream(void) {
+bool display_finish_image_stream(void) {
+  if (s_stream_flash_offset != 4096 + USER_IMG_TOTAL_BYTES) return false;
   const esp_partition_t *part = get_user_img_partition();
-  if (part) {
-    uint32_t header[2] = {USER_IMG_MAGIC, USER_IMG_TOTAL_BYTES};
-    esp_partition_write(part, 0, header, sizeof(header));
-  }
+  uint32_t header[2] = {USER_IMG_MAGIC, USER_IMG_TOTAL_BYTES};
+  if (!part || esp_partition_write(part, 0, header, sizeof(header)) != ESP_OK) return false;
   s_user_image_valid = true;
   s_current_screen = SCREEN_PICTURE;
   render_pagination(SCREEN_PICTURE);
+  return true;
 }
 
 void display_show_user_image(void) {
@@ -1767,7 +1809,7 @@ void display_show_ota_screen(uint8_t progress_pct) {
   tft_set_backlight(s_brightness_pct);
 
   if (s_display_mutex) {
-    xSemaphoreTake(s_display_mutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(s_display_mutex, portMAX_DELAY);
   }
 
   bool first_draw = (s_current_screen != SCREEN_OTA);
@@ -1832,7 +1874,7 @@ void display_show_ota_screen(uint8_t progress_pct) {
   }
 
   if (s_display_mutex) {
-    xSemaphoreGive(s_display_mutex);
+    xSemaphoreGiveRecursive(s_display_mutex);
   }
 }
 
@@ -1850,9 +1892,15 @@ void display_set_screen(uint8_t screen_id) {
            (int)s_current_screen, (int)screen_id);
 
   if (s_display_mutex) {
-    xSemaphoreTake(s_display_mutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(s_display_mutex, portMAX_DELAY);
   }
 
+  if (s_current_screen == screen_id && !s_screen_refresh) {
+    if (s_display_mutex) xSemaphoreGiveRecursive(s_display_mutex);
+    return;
+  }
+  s_screen_refresh = false;
+  s_media_frame = false;
   s_current_screen = (screen_id_t)screen_id;
   s_hud.is_frame_active = false; // Reset HUD static frame flag so entering
                                  // SCREEN_NAV initialises cleanly
@@ -1863,6 +1911,9 @@ void display_set_screen(uint8_t screen_id) {
     break;
   case SCREEN_NAV:
     display_show_main_screen();
+    break;
+  case SCREEN_MUSIC:
+    render_music();
     break;
   case SCREEN_PICTURE:
     display_show_user_image();
@@ -1878,7 +1929,7 @@ void display_set_screen(uint8_t screen_id) {
   }
 
   if (s_display_mutex) {
-    xSemaphoreGive(s_display_mutex);
+    xSemaphoreGiveRecursive(s_display_mutex);
   }
 }
 
@@ -1897,10 +1948,12 @@ void display_next_screen(void) {
     if (s_nav.is_navigating) {
       next = SCREEN_NAV;
     } else {
-      next = SCREEN_PICTURE; // Show image directly on swipe left from HOME when
+      next = SCREEN_MUSIC; // Show image directly on swipe left from HOME when
                              // no ride is started!
     }
   } else if (s_current_screen == SCREEN_NAV) {
+    next = SCREEN_MUSIC;
+  } else if (s_current_screen == SCREEN_MUSIC) {
     next = SCREEN_PICTURE;
   } else if (s_current_screen == SCREEN_PICTURE) {
     next = SCREEN_SETTINGS;
@@ -1924,6 +1977,8 @@ void display_prev_screen(void) {
   } else if (s_current_screen == SCREEN_SETTINGS) {
     prev = SCREEN_PICTURE;
   } else if (s_current_screen == SCREEN_PICTURE) {
+    prev = SCREEN_MUSIC;
+  } else if (s_current_screen == SCREEN_MUSIC) {
     if (s_nav.is_navigating) {
       prev = SCREEN_NAV;
     } else {
@@ -1941,7 +1996,15 @@ void display_prev_screen(void) {
 // =============================================================================
 // GESTURE & TOUCH EVENT HANDLER
 // =============================================================================
-void display_handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x,
+static void handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x, int16_t end_y, touch_gesture_t gesture);
+void display_handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x, int16_t end_y, touch_gesture_t gesture) {
+  if (!s_display_mutex) return;
+  xSemaphoreTakeRecursive(s_display_mutex, portMAX_DELAY);
+  handle_touch_event(start_x, start_y, end_x, end_y, gesture);
+  xSemaphoreGiveRecursive(s_display_mutex);
+}
+
+static void handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x,
                                 int16_t end_y, touch_gesture_t gesture) {
   // Completely lock touch input while firmware update is in progress
   if (s_current_screen == SCREEN_OTA) {
@@ -2000,10 +2063,7 @@ void display_handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x,
       ESP_LOGI(TAG, "SWIPE UP (top gesture) -> Brightness INC -> %d%%",
                s_brightness_pct);
       // Show high-visibility graphical brightness gauge
-      show_brightness_hud(s_brightness_pct);
-      vTaskDelay(pdMS_TO_TICKS(600));
-      // Redraw current screen to cleanly dismiss HUD
-      display_set_screen((uint8_t)s_current_screen);
+      display_set_screen(SCREEN_BRIGHTNESS);
     }
     break;
 
@@ -2050,6 +2110,27 @@ void display_handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x,
         return;
       }
       // Ignore touches outside modal when it's open
+      return;
+    }
+
+    if (s_current_screen == SCREEN_MUSIC) {
+      if (!s_ble_connected || s_media.state < 3) return;
+      uint8_t command = 0, action = 0;
+      if (ty >= 118 && ty <= 178) {
+        if (tx >= 10 && tx <= 104) { command = 4; action = 8; }
+        else if (tx >= 113 && tx <= 207) {
+          command = s_media.state == 4 ? 2 : 1;
+          action = s_media.state == 4 ? 2 : 1;
+        } else if (tx >= 216 && tx <= 310) { command = 3; action = 4; }
+      } else if (ty >= 187 && ty <= 230) {
+        if (tx >= 10 && tx <= 104) { command = 6; action = 16; }
+        else if (tx >= 216 && tx <= 310) { command = 5; action = 16; }
+      }
+      int64_t now = esp_timer_get_time();
+      if (command && (s_media.actions & action) && now - s_last_media_command_us >= 250000) {
+        s_last_media_command_us = now;
+        ble_media_command(command);
+      }
       return;
     }
 
@@ -2316,14 +2397,61 @@ static void nav_render_task(void *pvParam) {
   while (1) {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
 
-    if (!s_is_initialized || s_current_screen != SCREEN_NAV) {
+    if (!s_is_initialized || !s_display_power_on) {
       continue;
     }
 
     if (s_display_mutex &&
-        xSemaphoreTake(s_display_mutex, pdMS_TO_TICKS(35)) == pdTRUE) {
-      display_nav_render_partial();
-      xSemaphoreGive(s_display_mutex);
+        xSemaphoreTakeRecursive(s_display_mutex, pdMS_TO_TICKS(35)) == pdTRUE) {
+      if (s_notif_dismiss_requested) {
+        s_notif_dismiss_requested = false;
+        display_dismiss_notification();
+      }
+      int64_t started = esp_timer_get_time();
+      bool connected;
+      if (xQueueReceive(s_connection_queue, &connected, 0) == pdTRUE) {
+        s_ble_connected = connected;
+        s_phone_state_ready = false;
+        s_media_dirty = true;
+        s_route_seg_dirty = true;
+        s_nav_interrupted = !connected && s_nav.is_navigating;
+      }
+      notification_info_t notification;
+      if (xQueueReceive(s_notification_queue, &notification, 0) == pdTRUE)
+        apply_notification(notification.title, notification.message);
+      navigation_data_t nav;
+      if (xQueueReceive(s_nav_queue, &nav, 0) == pdTRUE) apply_navigation(&nav);
+      route_segment_t segment;
+      if (xQueueReceive(s_route_queue, &segment, 0) == pdTRUE && s_nav.is_navigating &&
+          memcmp(&segment, &s_route_seg, sizeof(segment)) != 0) {
+        s_route_seg = segment;
+        s_route_seg_dirty = true;
+      }
+      nav_context_t context;
+      if (xQueueReceive(s_context_queue, &context, 0) == pdTRUE && s_nav.is_navigating &&
+          memcmp(&context, &s_nav_context, sizeof(context)) != 0) {
+        s_nav_context = context;
+        s_route_seg_dirty = true;
+      }
+      media_state_t media;
+      if (xQueueReceive(s_media_queue, &media, 0) == pdTRUE && memcmp(&media, &s_media, sizeof(media)) != 0) {
+        s_media = media;
+        s_media_dirty = true;
+      }
+      if (s_current_screen == SCREEN_NAV) display_nav_render_partial();
+      else if (s_current_screen == SCREEN_MUSIC && !s_latest_notif.active) render_music();
+      int64_t elapsed = esp_timer_get_time() - started;
+      static int64_t last_metrics, max_render_us;
+      if (elapsed > max_render_us) max_render_us = elapsed;
+      if (esp_timer_get_time() - last_metrics >= 30000000) {
+        last_metrics = esp_timer_get_time();
+        ESP_LOGI(TAG, "metrics: max_render_us=%lld heap=%u largest=%u stack_free=%u", max_render_us,
+          (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+          (unsigned)uxTaskGetStackHighWaterMark(NULL));
+        max_render_us = 0;
+      }
+      xSemaphoreGiveRecursive(s_display_mutex);
     }
   }
 }
@@ -2333,15 +2461,24 @@ void display_init(void) {
     return;
 
   if (!s_display_mutex) {
-    s_display_mutex = xSemaphoreCreateMutex();
+    s_display_mutex = xSemaphoreCreateRecursiveMutex();
   }
 
+  s_nav_queue = xQueueCreateStatic(1, sizeof(navigation_data_t), s_nav_queue_bytes, &s_nav_queue_storage);
+  s_media_queue = xQueueCreateStatic(1, sizeof(media_state_t), s_media_queue_bytes, &s_media_queue_storage);
+  s_route_queue = xQueueCreateStatic(1, sizeof(route_segment_t), s_route_queue_bytes, &s_route_queue_storage);
+  s_context_queue = xQueueCreateStatic(1, sizeof(nav_context_t), s_context_queue_bytes, &s_context_queue_storage);
+  s_connection_queue = xQueueCreateStatic(1, sizeof(bool), s_connection_queue_bytes, &s_connection_queue_storage);
+  s_notification_queue = xQueueCreateStatic(1, sizeof(notification_info_t), s_notification_queue_bytes, &s_notification_queue_storage);
+  configASSERT(s_display_mutex && s_nav_queue && s_media_queue && s_route_queue &&
+      s_context_queue && s_connection_queue && s_notification_queue);
   ESP_ERROR_CHECK(tft_init());
-  touch_init();
+  ESP_ERROR_CHECK(touch_init());
 
   if (!s_nav_render_task_handle) {
-    xTaskCreate(nav_render_task, "nav_render", 4096, NULL, 3,
+    BaseType_t created = xTaskCreate(nav_render_task, "nav_render", 4096, NULL, 3,
                 &s_nav_render_task_handle);
+    configASSERT(created == pdPASS);
   }
 
   s_is_initialized = true;
@@ -2356,22 +2493,16 @@ void display_set_time(uint8_t hours, uint8_t minutes) {
   s_time_minutes = minutes;
   if (s_is_initialized && s_current_screen == SCREEN_HOME) {
     if (s_display_mutex &&
-        xSemaphoreTake(s_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        xSemaphoreTakeRecursive(s_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
       draw_home_screen_clock();
-      xSemaphoreGive(s_display_mutex);
+      xSemaphoreGiveRecursive(s_display_mutex);
     }
   }
 }
 
 void display_set_ble_status(bool connected) {
-  if (s_ble_connected == connected)
-    return;
-  s_ble_connected = connected;
-  ESP_LOGI(TAG, "BLE status changed: %s", connected ? "LINKED" : "SEARCHING");
-
-  if (connected && s_nav_interrupted) {
-    display_show_resume_route_modal();
-  }
+  if (s_nav_queue) xQueueReset(s_nav_queue);
+  if (s_connection_queue) xQueueOverwrite(s_connection_queue, &connected);
 }
 
 void display_set_speed(uint16_t speed_kmh) {
@@ -2430,9 +2561,15 @@ void display_set_imu_heading(float heading_deg) {
 
 
 void display_update_navigation(const navigation_data_t *nav_data) {
+  if (s_nav_queue && nav_data) xQueueOverwrite(s_nav_queue, nav_data);
+}
+
+static void apply_navigation(const navigation_data_t *nav_data) {
   if (!nav_data)
     return;
 
+  if (!s_phone_state_ready) s_route_seg_dirty = true;
+  s_phone_state_ready = true;
   navigation_data_t filtered = *nav_data;
   if (filtered.speed_kmh < 3)
     filtered.speed_kmh = 0;
@@ -2447,8 +2584,10 @@ void display_update_navigation(const navigation_data_t *nav_data) {
     }
   }
 
-  if (s_display_mutex &&
-      xSemaphoreTake(s_display_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+  bool entering = !s_nav.is_navigating && filtered.is_navigating;
+  bool critical_turn = filtered.is_navigating && filtered.gps_available &&
+      filtered.maneuver_state == 4 && s_nav.maneuver_state != 4 && s_current_screen == SCREEN_MUSIC;
+  {
     if (!s_nav.rerouting && filtered.rerouting) {
       s_nav_context.poi_type = 0;
       s_nav_context.poi_name[0] = '\0';
@@ -2468,10 +2607,10 @@ void display_update_navigation(const navigation_data_t *nav_data) {
     }
     memcpy(&s_nav, &filtered, sizeof(navigation_data_t));
     s_speed_kmh = filtered.speed_kmh;
-    xSemaphoreGive(s_display_mutex);
-  } else {
-    ESP_LOGW(TAG, "Navigation update deferred: display busy");
-    return;
+  }
+  if ((entering || critical_turn) && s_current_screen != SCREEN_OTA) {
+    s_current_screen = SCREEN_NAV;
+    s_hud.is_frame_active = false;
   }
 
   if (nav_data->is_navigating) {
@@ -2488,37 +2627,35 @@ void display_update_navigation(const navigation_data_t *nav_data) {
 }
 
 void display_update_route_segment(const route_segment_t *seg) {
-  if (!seg)
-    return;
-  // Route packets are infrequent and must not be silently dropped while the
-  // render task holds the display lock.
-  if (s_display_mutex &&
-      xSemaphoreTake(s_display_mutex, portMAX_DELAY) == pdTRUE) {
-    if (memcmp(&s_route_seg, seg, sizeof(route_segment_t)) != 0) {
-      memcpy(&s_route_seg, seg, sizeof(route_segment_t));
-      s_route_seg_dirty = true;
-    }
-    xSemaphoreGive(s_display_mutex);
-  }
+  if (seg && s_route_queue) xQueueOverwrite(s_route_queue, seg);
 }
 
 void display_update_nav_context(const nav_context_t *context) {
-  if (!context || !s_display_mutex) return;
-  if (xSemaphoreTake(s_display_mutex, portMAX_DELAY) == pdTRUE) {
-    if (memcmp(&s_nav_context, context, sizeof(s_nav_context)) != 0) {
-      memcpy(&s_nav_context, context, sizeof(s_nav_context));
-      s_route_seg_dirty = true;
-    }
-    xSemaphoreGive(s_display_mutex);
-  }
+  if (context && s_context_queue) xQueueOverwrite(s_context_queue, context);
+}
+
+bool display_map_packet(const uint8_t *packet, size_t len) {
+  if (!s_display_mutex || xSemaphoreTakeRecursive(s_display_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+  bool ok = map_frame_packet(packet, len);
+  if (ok) s_route_seg_dirty = true;
+  xSemaphoreGiveRecursive(s_display_mutex);
+  return ok;
+}
+
+void display_begin_route_revision(void) {
+  if (s_display_mutex) xSemaphoreTakeRecursive(s_display_mutex, portMAX_DELAY);
+  map_frame_invalidate();
+  if (s_display_mutex) xSemaphoreGiveRecursive(s_display_mutex);
+  if (s_route_queue) xQueueReset(s_route_queue);
+  if (s_context_queue) xQueueReset(s_context_queue);
 }
 
 void display_clear(void) {
   if (s_display_mutex)
-    xSemaphoreTake(s_display_mutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(s_display_mutex, portMAX_DELAY);
   tft_fill_screen(COLOR_SURFACE_DARK);
   if (s_display_mutex)
-    xSemaphoreGive(s_display_mutex);
+    xSemaphoreGiveRecursive(s_display_mutex);
 }
 
 // =============================================================================
@@ -2532,6 +2669,10 @@ void display_nav_zoom_in(void) {
     s_zoom_level = NAV_ZOOM_LEVEL_4;
   } else if (s_zoom_level > NAV_ZOOM_LEVEL_1) {
     s_zoom_level = (nav_zoom_level_t)((int)s_zoom_level - 1);
+  }
+  if (map_frame_active()) {
+    uint8_t zoom_packet[2] = {0x14, s_camera_mode == NAV_CAMERA_OVERVIEW ? 255 : (uint8_t)(18 - (int)s_zoom_level)};
+    ble_nav_notify_diagnostic_packet(zoom_packet, sizeof(zoom_packet));
   }
   ESP_LOGI(TAG, "Nav Zoom In: Level %d", (int)s_zoom_level);
   if (s_is_initialized && s_current_screen == SCREEN_NAV) {
@@ -2547,6 +2688,10 @@ void display_nav_zoom_out(void) {
     s_camera_mode = NAV_CAMERA_OVERVIEW;
     s_zoom_level = NAV_ZOOM_LEVEL_5;
   }
+  if (map_frame_active()) {
+    uint8_t zoom_packet[2] = {0x14, s_camera_mode == NAV_CAMERA_OVERVIEW ? 255 : (uint8_t)(18 - (int)s_zoom_level)};
+    ble_nav_notify_diagnostic_packet(zoom_packet, sizeof(zoom_packet));
+  }
   ESP_LOGI(TAG, "Nav Zoom Out: Level %d, Mode %d", (int)s_zoom_level,
            (int)s_camera_mode);
   if (s_is_initialized && s_current_screen == SCREEN_NAV) {
@@ -2559,6 +2704,10 @@ void display_nav_recenter(void) {
   s_zoom_level = NAV_ZOOM_LEVEL_2; // Close heading-up follow view
   s_pan_offset_x = 0;
   s_pan_offset_y = 0;
+  if (map_frame_active()) {
+    uint8_t zoom_packet[2] = {0x14, 254};
+    ble_nav_notify_diagnostic_packet(zoom_packet, sizeof(zoom_packet));
+  }
   ESP_LOGI(TAG, "Nav Recenter -> Follow Mode at Zoom Level 2");
   if (s_is_initialized && s_current_screen == SCREEN_NAV) {
     s_route_seg_dirty = true;
@@ -2571,7 +2720,11 @@ void display_nav_toggle_overview(void) {
   } else {
     s_camera_mode = NAV_CAMERA_OVERVIEW;
     s_zoom_level = NAV_ZOOM_LEVEL_5;
-    ESP_LOGI(TAG, "Nav Toggle -> Route Overview");
+    if (map_frame_active()) {
+    uint8_t zoom_packet[2] = {0x14, s_camera_mode == NAV_CAMERA_OVERVIEW ? 255 : (uint8_t)(18 - (int)s_zoom_level)};
+    ble_nav_notify_diagnostic_packet(zoom_packet, sizeof(zoom_packet));
+  }
+  ESP_LOGI(TAG, "Nav Toggle -> Route Overview");
     if (s_is_initialized && s_current_screen == SCREEN_NAV) {
       s_route_seg_dirty = true;
     }
@@ -2591,9 +2744,7 @@ void display_nav_pan(int16_t dx, int16_t dy) {
     s_pan_offset_y = 80;
   if (s_pan_offset_y < -80)
     s_pan_offset_y = -80;
-  if (s_is_initialized && s_current_screen == SCREEN_NAV) {
-    display_show_main_screen();
-  }
+  if (s_is_initialized && s_current_screen == SCREEN_NAV) s_route_seg_dirty = true;
 }
 
 nav_zoom_level_t display_nav_get_zoom(void) { return s_zoom_level; }
@@ -2606,15 +2757,23 @@ nav_camera_mode_t display_nav_get_camera_mode(void) { return s_camera_mode; }
 
 static void notif_auto_dismiss_timer_cb(TimerHandle_t xTimer) {
   ESP_LOGI(TAG, "Notification auto-dismiss timer fired (2s)");
-  display_dismiss_notification();
+  s_notif_dismiss_requested = true;
 }
 
 void display_show_notification(const char *title, const char *message) {
+  if (!s_notification_queue) return;
+  notification_info_t notification = {0};
+  snprintf(notification.title, sizeof(notification.title), "%s", title ? title : "");
+  snprintf(notification.message, sizeof(notification.message), "%s", message ? message : "");
+  xQueueOverwrite(s_notification_queue, &notification);
+}
+
+static void apply_notification(const char *title, const char *message) {
   if (!s_is_initialized)
     return;
 
   if (s_display_mutex &&
-      xSemaphoreTake(s_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      xSemaphoreTakeRecursive(s_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     // Strictly replace previous notification with the latest one
     memset(&s_latest_notif, 0, sizeof(s_latest_notif));
     if (title && title[0]) {
@@ -2636,7 +2795,7 @@ void display_show_notification(const char *title, const char *message) {
     // Render banner directly over current screen
     render_notification_banner();
 
-    xSemaphoreGive(s_display_mutex);
+    xSemaphoreGiveRecursive(s_display_mutex);
   }
 
   // Start or reset 2-second auto-dismiss timer
@@ -2659,7 +2818,7 @@ void display_dismiss_notification(void) {
   }
 
   if (s_display_mutex &&
-      xSemaphoreTake(s_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      xSemaphoreTakeRecursive(s_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     s_latest_notif.active = false;
     memset(&s_latest_notif, 0, sizeof(s_latest_notif));
 
@@ -2671,6 +2830,10 @@ void display_dismiss_notification(void) {
     case SCREEN_NAV:
       display_show_main_screen();
       break;
+    case SCREEN_MUSIC:
+      s_media_frame = false;
+      render_music();
+      break;
     case SCREEN_PICTURE:
       display_show_user_image();
       break;
@@ -2681,7 +2844,7 @@ void display_dismiss_notification(void) {
       break;
     }
 
-    xSemaphoreGive(s_display_mutex);
+    xSemaphoreGiveRecursive(s_display_mutex);
   }
 }
 

@@ -91,6 +91,8 @@ esp_err_t ota_write_chunk(uint32_t offset, const uint8_t *data, uint16_t length)
         return ESP_ERR_INVALID_STATE;
     }
 
+    if (!data || length == 0 || s_received_bytes > s_total_image_size ||
+        length > s_total_image_size - s_received_bytes) return ESP_ERR_INVALID_SIZE;
     s_ota_status = OTA_STATUS_RECEIVING;
 
     esp_err_t err = esp_ota_write(s_ota_handle, (const void *)data, length);

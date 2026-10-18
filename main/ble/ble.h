@@ -45,6 +45,7 @@ void ble_disconnect_and_restart(void);
  * @brief Notify phone of device status or button trigger over BLE 0xFF32
  */
 void ble_nav_notify_status(uint8_t status_code);
+void ble_media_command(uint8_t command);
 
 /**
  * @brief Notify phone of diagnostic payload over BLE 0xFF32

@@ -109,6 +109,7 @@ static TimerHandle_t s_adv_timer = NULL;
 #define IMG_CHUNK_SIZE   128u
 static uint32_t s_img_bytes_received = 0;
 static bool     s_img_transfer_active = false;
+static uint8_t s_img_status = IMG_STATUS_READY;
 
 
 // Forward declarations
@@ -119,6 +120,10 @@ static int ble_ota_status_access(uint16_t conn_handle, uint16_t attr_handle, str
 static int ble_img_control_access(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg);
 static int ble_img_data_access(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg);
 static int ble_img_status_access(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg);
+static uint32_t s_route_revision;
+static bool s_revision_received;
+static uint16_t s_img_expected_seq;
+
 static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg);
 static int ble_nav_status_access(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg);
 
@@ -258,6 +263,7 @@ static int ble_ota_control_access(uint16_t conn_handle, uint16_t attr_handle,
 
         switch (opcode) {
         case OTA_CMD_START: {
+            if (s_img_transfer_active) return BLE_ATT_ERR_UNLIKELY;
             if (len < 5) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
             uint32_t image_size = (uint32_t)cmd_buf[1] |
                                   ((uint32_t)cmd_buf[2] << 8) |
@@ -385,6 +391,7 @@ static int ble_ota_status_access(uint16_t conn_handle, uint16_t attr_handle,
 
 static void ble_img_notify_status(uint8_t status_code, uint8_t progress_pct)
 {
+    s_img_status = status_code;
     if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || s_img_status_val_handle == 0) return;
     uint8_t buf[2] = { status_code, progress_pct };
     struct os_mbuf *om = ble_hs_mbuf_from_flat(buf, sizeof(buf));
@@ -415,19 +422,34 @@ static int ble_img_control_access(uint16_t conn_handle, uint16_t attr_handle,
             return 0;
         }
 
+        if (ota_get_status() == OTA_STATUS_READY || ota_get_status() == OTA_STATUS_RECEIVING)
+            return BLE_ATT_ERR_UNLIKELY;
+        s_img_expected_seq = 0;
         s_img_bytes_received  = 0;
         s_img_transfer_active = true;
-        display_start_image_stream();
+        if (!display_start_image_stream()) {
+            s_img_transfer_active = false;
+            ble_img_notify_status(IMG_STATUS_ERROR_ABORTED, 0);
+            return BLE_ATT_ERR_UNLIKELY;
+        }
         ESP_LOGI(TAG, "IMG: START — direct TFT stream expecting %" PRIu32 " bytes", image_size);
         ble_img_notify_status(IMG_STATUS_READY, 0);
         return 0;
     }
     case IMG_CMD_FINISH: {
+        if (!s_img_transfer_active || s_img_bytes_received != IMG_TOTAL_BYTES) {
+            s_img_transfer_active = false;
+            ble_img_notify_status(IMG_STATUS_ERROR_SIZE, 0);
+            return BLE_ATT_ERR_UNLIKELY;
+        }
         s_img_transfer_active = false;
         uint8_t pct = (uint8_t)((s_img_bytes_received * 100u) / IMG_TOTAL_BYTES);
         ESP_LOGI(TAG, "IMG: FINISH — %" PRIu32 "/%u bytes received (%d%%)",
                  s_img_bytes_received, (unsigned)IMG_TOTAL_BYTES, pct);
-        display_finish_image_stream();
+        if (!display_finish_image_stream()) {
+            ble_img_notify_status(IMG_STATUS_ERROR_SIZE, 0);
+            return BLE_ATT_ERR_UNLIKELY;
+        }
         ble_img_notify_status(IMG_STATUS_SUCCESS, 100);
         return 0;
     }
@@ -465,10 +487,16 @@ static int ble_img_data_access(uint16_t conn_handle, uint16_t attr_handle,
     const uint8_t *payload = &chunk_buf[2];
     uint16_t       pay_len = len - 2;
 
-    if (s_img_bytes_received + pay_len > IMG_TOTAL_BYTES) {
-        pay_len = (uint16_t)(IMG_TOTAL_BYTES - s_img_bytes_received);
+    uint16_t seq = (uint16_t)chunk_buf[0] | ((uint16_t)chunk_buf[1] << 8);
+    if (s_img_expected_seq > 0 && seq == s_img_expected_seq - 1) return 0;
+    if (seq != s_img_expected_seq || (pay_len & 1) ||
+        s_img_bytes_received + pay_len > IMG_TOTAL_BYTES) return BLE_ATT_ERR_UNLIKELY;
+    s_img_expected_seq++;
+    if (!display_write_image_chunk(payload, pay_len)) {
+        s_img_transfer_active = false;
+        ble_img_notify_status(IMG_STATUS_ERROR_ABORTED, 0);
+        return BLE_ATT_ERR_UNLIKELY;
     }
-    display_write_image_chunk(payload, pay_len);
     s_img_bytes_received += pay_len;
 
     // Notify progress every ~5%
@@ -487,7 +515,7 @@ static int ble_img_status_access(uint16_t conn_handle, uint16_t attr_handle,
 {
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
         uint8_t buf[2] = {
-            s_img_transfer_active ? IMG_STATUS_RECEIVING : IMG_STATUS_SUCCESS,
+            s_img_status,
             (uint8_t)((s_img_bytes_received * 100u) / IMG_TOTAL_BYTES)
         };
         os_mbuf_append(ctxt->om, buf, sizeof(buf));
@@ -534,6 +562,49 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
     uint16_t len = 0;
     int rc = ble_hs_mbuf_to_flat(ctxt->om, rx_buf, sizeof(rx_buf) - 1, &len);
     if (rc != 0 || len == 0) return BLE_ATT_ERR_UNLIKELY;
+
+    if (rx_buf[0] == 0x13) {
+        if (len < 6) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        uint32_t revision = (uint32_t)rx_buf[1] | ((uint32_t)rx_buf[2] << 8) |
+            ((uint32_t)rx_buf[3] << 16) | ((uint32_t)rx_buf[4] << 24);
+        uint8_t op = rx_buf[5];
+        if (!((op >= NAV_OP_START && op <= NAV_OP_STOP) || op == NAV_OP_SYNC ||
+              op == NAV_OP_ROUTE_SEGMENT || op == NAV_OP_CONTEXT || (op >= 0x14 && op <= 0x19)))
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        if (s_revision_received && (int32_t)(revision - s_route_revision) < 0) return BLE_ATT_ERR_UNLIKELY;
+        if (!s_revision_received || revision != s_route_revision) {
+            // Route changes invalidate geometry, but keep the visible old route
+            // until its replacement arrives; the next segment replaces it.
+            display_begin_route_revision();
+            s_route_revision = revision;
+            s_revision_received = true;
+        }
+        memmove(rx_buf, rx_buf + 5, len - 5);
+        len -= 5;
+    }
+    if (rx_buf[0] >= 0x14 && rx_buf[0] <= 0x19) {
+        if (s_img_transfer_active || (ota_get_status() == OTA_STATUS_READY || ota_get_status() == OTA_STATUS_RECEIVING)) return BLE_ATT_ERR_UNLIKELY;
+        return display_map_packet(rx_buf, len) ? 0 : BLE_ATT_ERR_UNLIKELY;
+    }
+    if (rx_buf[0] == 0x12) {
+        if (len < 6 || rx_buf[1] > 5 || rx_buf[2] > 31 || rx_buf[3] > 100)
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        size_t title_len = rx_buf[4];
+        if (title_len > 40 || len < 6 + title_len) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        size_t artist_len = rx_buf[5 + title_len];
+        if (artist_len > 32 || len != 6 + title_len + artist_len)
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        media_state_t media = {0};
+        media.state = rx_buf[1]; media.actions = rx_buf[2]; media.volume = rx_buf[3];
+        memcpy(media.title, rx_buf + 5, title_len);
+        memcpy(media.artist, rx_buf + 6 + title_len, artist_len);
+        for (size_t i = 0; i < title_len; i++)
+            if (media.title[i] < 32 || media.title[i] > 126) media.title[i] = '?';
+        for (size_t i = 0; i < artist_len; i++)
+            if (media.artist[i] < 32 || media.artist[i] > 126) media.artist[i] = '?';
+        display_update_media(&media);
+        return 0;
+    }
 
     rx_buf[len] = '\0';
 
@@ -601,7 +672,9 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
         nav_data.distance_meters = maneuver_dist;
         nav_data.speed_kmh = speed;
         nav_data.remaining_dist_km = (float)rem_dist / 1000.0f;
-        nav_data.is_navigating = (strstr(maneuver_str, "ARRIVE") == NULL);
+        nav_data.is_navigating = nav_data.direction != NAV_DIR_REACHED;
+        nav_data.gps_available = true;
+        snprintf(nav_data.eta_time_str, sizeof(nav_data.eta_time_str), "%lu min", (unsigned long)(eta_secs / 60));
         strncpy(nav_data.current_street, street_str[0] ? street_str : "Motorcycle Route", sizeof(nav_data.current_street) - 1);
 
         char next_maneuver_str[32] = {0};
@@ -642,27 +715,9 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
             }
         }
         nav_data.next_distance_meters = next_maneuver_dist;
-        strncpy(nav_data.next_street, next_street_str[0] ? next_street_str : "Continue Straight", sizeof(nav_data.next_street) - 1);
-
-        if (nav_data.is_navigating && nav_data.next_direction == NAV_DIR_NONE) {
-            if (nav_data.remaining_dist_km > 0.0f && nav_data.remaining_dist_km <= 0.4f) {
-                nav_data.next_direction = NAV_DIR_REACHED;
-                nav_data.next_distance_meters = (uint32_t)(nav_data.remaining_dist_km * 1000.0f);
-                strncpy(nav_data.next_street, "Destination", sizeof(nav_data.next_street) - 1);
-            } else {
-                uint32_t total_rem_m = (uint32_t)(nav_data.remaining_dist_km * 1000.0f);
-                nav_data.next_distance_meters = (total_rem_m > nav_data.distance_meters) ? (total_rem_m - nav_data.distance_meters) : 1200;
-                nav_data.next_direction = NAV_DIR_STRAIGHT;
-                strncpy(nav_data.next_street, "Continue Straight", sizeof(nav_data.next_street) - 1);
-            }
-        }
+        strncpy(nav_data.next_street, next_street_str, sizeof(nav_data.next_street) - 1);
 
         display_update_navigation(&nav_data);
-        if (nav_data.is_navigating && display_get_current_screen() != SCREEN_NAV) {
-            ESP_LOGI(TAG, "Active navigation (JSON) -> switching to SCREEN_NAV (current=%d)",
-                     display_get_current_screen());
-            display_set_screen(SCREEN_NAV);
-        }
         return 0;
     }
 
@@ -724,11 +779,11 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
             uint8_t diag_buf[7] = {
                 NAV_STATUS_DIAGNOSTICS, // 0x10
                 1,                      // Bluetooth link OK
-                1,                      // GPS status OK
-                1,                      // Display TFT 320x240 OK
-                100,                    // Power / Battery status OK (100%)
-                0,                      // Power source (External / Not charging)
-                42                      // 4.2V nominal (deci-volts)
+                0xFF,                   // GPS health not measured by this device
+                0xFF,                   // Display health not measured
+                0xFF,                   // Battery measurement unavailable
+                0xFF,                   // Power source unknown
+                0xFF                    // Voltage unknown
             };
             ble_nav_notify_diagnostic_packet(diag_buf, sizeof(diag_buf));
             return 0;
@@ -761,7 +816,7 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
     // 3. Route Segment packet format (OpCode 0x0B)
     if (len >= 7 && rx_buf[0] == NAV_OP_ROUTE_SEGMENT) {
         uint8_t count = rx_buf[1];
-        if (count > ROUTE_MAX_POINTS) count = ROUTE_MAX_POINTS;
+        if (count > ROUTE_MAX_POINTS) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
         if (len >= (size_t)(7 + count * 4)) {
             route_segment_t seg;
             memset(&seg, 0, sizeof(seg));
@@ -779,6 +834,8 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
             for (uint8_t i = 0; i < count; i++) {
                 seg.points[i].x = (uint16_t)rx_buf[offset] | ((uint16_t)rx_buf[offset + 1] << 8);
                 seg.points[i].y = (uint16_t)rx_buf[offset + 2] | ((uint16_t)rx_buf[offset + 3] << 8);
+                if (seg.points[i].x > 320 || seg.points[i].y > 240)
+                    return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
                 offset += 4;
             }
             ESP_LOGI(TAG, "NAV Route Segment: %d pts, dest_vis=%d (%d,%d)",
@@ -789,7 +846,8 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
     }
 
     // 4. Compact Binary packet format (Production mode)
-    if (len >= 18) {
+    if (len >= 18 && ((rx_buf[0] >= NAV_OP_START && rx_buf[0] <= NAV_OP_STOP) ||
+                      rx_buf[0] == NAV_OP_SYNC)) {
         uint8_t opcode = rx_buf[0];
         uint8_t maneuver = rx_buf[1];
         uint32_t maneuver_dist = (uint32_t)rx_buf[2] | ((uint32_t)rx_buf[3] << 8);
@@ -810,6 +868,7 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
             maneuver_state = rx_buf[17];
             maneuver_id = (uint16_t)rx_buf[18] | ((uint16_t)rx_buf[19] << 8);
             text_len = rx_buf[20];
+            if (text_len > 31 || len < 21 + text_len) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
             if (text_len > 0 && len >= (size_t)(21 + text_len)) {
                 int copy_bytes = (text_len < 31) ? text_len : 31;
                 memcpy(street_buf, &rx_buf[21], copy_bytes);
@@ -818,6 +877,7 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
         } else {
             // Legacy 18-byte header
             text_len = rx_buf[17];
+            if (text_len > 31 || len < 18 + text_len) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
             if (text_len > 0 && len >= (size_t)(18 + text_len)) {
                 int copy_bytes = (text_len < 31) ? text_len : 31;
                 memcpy(street_buf, &rx_buf[18], copy_bytes);
@@ -833,7 +893,6 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
             nav_data.speed_kmh = 0;
             strncpy(nav_data.current_street, "Navigation Ended", sizeof(nav_data.current_street) - 1);
             display_update_navigation(&nav_data);
-            display_set_screen(SCREEN_HOME);
             return 0;
         }
 
@@ -869,12 +928,15 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
 
         // Lookahead / Secondary maneuver parsing
         size_t next_offset = (len >= 21 ? 21 : 18) + text_len;
-        if (len >= next_offset + 3) {
+        if (len > next_offset && len < next_offset + 4) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        if (len >= next_offset + 4) {
             uint8_t next_man = rx_buf[next_offset];
             uint16_t next_dist = (uint16_t)rx_buf[next_offset + 1] | ((uint16_t)rx_buf[next_offset + 2] << 8);
             char next_street_buf[32] = {0};
             if (len >= next_offset + 4) {
                 uint8_t next_txt_len = rx_buf[next_offset + 3];
+                if (next_txt_len > 31 || len != next_offset + 4 + next_txt_len)
+                    return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
                 if (next_txt_len > 0 && len >= next_offset + 4 + next_txt_len) {
                     int copy_n = (next_txt_len < 31) ? next_txt_len : 31;
                     memcpy(next_street_buf, &rx_buf[next_offset + 4], copy_n);
@@ -883,31 +945,12 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
             }
             nav_data.next_direction = ble_code_to_nav_direction(next_man);
             nav_data.next_distance_meters = next_dist;
-            strncpy(nav_data.next_street, next_street_buf[0] ? next_street_buf : "Continue Straight", sizeof(nav_data.next_street) - 1);
-        } else {
-            // Intelligent lookahead fallback when packet does not carry secondary turn extension
-            if (nav_data.is_navigating) {
-                if (nav_data.remaining_dist_km > 0.0f && nav_data.remaining_dist_km <= 0.4f) {
-                    nav_data.next_direction = NAV_DIR_REACHED;
-                    nav_data.next_distance_meters = (uint32_t)(nav_data.remaining_dist_km * 1000.0f);
-                    strncpy(nav_data.next_street, "Destination", sizeof(nav_data.next_street) - 1);
-                } else {
-                    uint32_t total_rem_m = (uint32_t)(nav_data.remaining_dist_km * 1000.0f);
-                    nav_data.next_distance_meters = (total_rem_m > nav_data.distance_meters) ? (total_rem_m - nav_data.distance_meters) : 1200;
-                    nav_data.next_direction = NAV_DIR_STRAIGHT;
-                    strncpy(nav_data.next_street, "Continue Straight", sizeof(nav_data.next_street) - 1);
-                }
-            }
+            strncpy(nav_data.next_street, next_street_buf, sizeof(nav_data.next_street) - 1);
         }
 
         // A real route start owns the HUD. Switch to SCREEN_NAV whenever
         // active navigation is running so the rider immediately sees turn directions.
         display_update_navigation(&nav_data);
-        if (nav_data.is_navigating && (opcode == NAV_OP_START || display_get_current_screen() != SCREEN_NAV)) {
-            ESP_LOGI(TAG, "Active navigation (Binary Op=0x%02X) -> switching to SCREEN_NAV (current=%d)",
-                     opcode, display_get_current_screen());
-            display_set_screen(SCREEN_NAV);
-        }
         return 0;
     }
 
@@ -919,11 +962,18 @@ static int ble_nav_status_access(uint16_t conn_handle, uint16_t attr_handle,
                                  struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
-        uint8_t status_buf[2] = { 0x01, 0x00 }; // Device ready
+        uint8_t status_buf[2] = { 0x01, 0x02 }; // Navigation protocol + RAM map frames
         os_mbuf_append(ctxt->om, status_buf, sizeof(status_buf));
         return 0;
     }
     return BLE_ATT_ERR_UNLIKELY;
+}
+
+void ble_media_command(uint8_t command)
+{
+    if (command < 1 || command > 7) return;
+    uint8_t packet[2] = {0x12, command};
+    ble_nav_notify_diagnostic_packet(packet, sizeof(packet));
 }
 
 void ble_nav_notify_status(uint8_t status_code)
@@ -1132,6 +1182,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
             s_is_connected = true;
+            s_revision_received = false;
             if (s_adv_timer) xTimerStop(s_adv_timer, 0);
             ESP_LOGI(TAG, "Phone connected (conn_handle=%d)! Services online.", s_conn_handle);
             display_set_ble_status(true);
@@ -1162,6 +1213,9 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
         break;
 
     case BLE_GAP_EVENT_DISCONNECT:
+        if (s_img_transfer_active) s_img_status = IMG_STATUS_ERROR_ABORTED;
+        s_img_transfer_active = false;
+        s_revision_received = false;
         s_is_connected = false;
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         if (ota_get_status() == OTA_STATUS_READY ||

@@ -1,6 +1,7 @@
 idf_component_register(SRCS "main.c"
                             "ota/ota.c"
                             "display/display.c"
+                            "display/map_frame.c"
                             "display/display_tft.c"
                             "display/touch.c"
                             "ble/ble.c"

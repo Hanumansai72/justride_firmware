@@ -10,6 +10,7 @@
 static const char *TAG = "DISPLAY_TFT";
 
 static spi_device_handle_t s_spi = NULL;
+static esp_err_t s_spi_error = ESP_OK;
 static uint16_t s_width = DISPLAY_WIDTH;
 static uint16_t s_height = DISPLAY_HEIGHT;
 static SemaphoreHandle_t s_spi_mutex = NULL;
@@ -138,7 +139,11 @@ static void tft_send_cmd(uint8_t cmd) {
         .length = 8,
         .tx_buffer = &cmd,
     };
-    spi_device_polling_transmit(s_spi, &t);
+    esp_err_t err = spi_device_polling_transmit(s_spi, &t);
+    if (err != ESP_OK && s_spi_error == ESP_OK) {
+        s_spi_error = err;
+        ESP_LOGE(TAG, "SPI transfer failed: %s", esp_err_to_name(err));
+    }
     tft_spi_unlock();
 }
 
@@ -150,7 +155,11 @@ static void tft_send_data(const uint8_t *data, int len) {
         .length = len * 8,
         .tx_buffer = data,
     };
-    spi_device_polling_transmit(s_spi, &t);
+    esp_err_t err = spi_device_polling_transmit(s_spi, &t);
+    if (err != ESP_OK && s_spi_error == ESP_OK) {
+        s_spi_error = err;
+        ESP_LOGE(TAG, "SPI transfer failed: %s", esp_err_to_name(err));
+    }
     tft_spi_unlock();
 }
 
@@ -224,6 +233,7 @@ esp_err_t tft_init(void) {
 
     if (!s_spi_mutex) {
         s_spi_mutex = xSemaphoreCreateRecursiveMutex();
+        if (!s_spi_mutex) return ESP_ERR_NO_MEM;
     }
 
     // Configure DC and RST output GPIOs
@@ -324,6 +334,7 @@ esp_err_t tft_init(void) {
     // Pre-clear to black while backlight is still off.
     // display_show_splash() will raise the backlight after the first frame is ready.
     tft_fill_screen(COLOR_BLACK);
+    if (s_spi_error != ESP_OK) return s_spi_error;
     ESP_LOGI(TAG, "TFT initialization complete. Mode: Landscape %dx%d.", s_width, s_height);
     return ESP_OK;
 }
@@ -366,10 +377,13 @@ void tft_set_rotation(uint8_t rotation) {
 
 void tft_draw_pixel(int x, int y, uint16_t color) {
     if (x < 0 || x >= s_width || y < 0 || y >= s_height) return;
+    tft_spi_lock();
     tft_set_addr_window(x, y, x, y);
     uint8_t data[2] = { (color >> 8) & 0xFF, color & 0xFF };
     tft_send_data(data, 2);
+    tft_spi_unlock();
 }
+
 
 void tft_draw_fast_h_line(int x, int y, int w, uint16_t color) {
     if (y < 0 || y >= s_height || x >= s_width) return;
@@ -377,6 +391,7 @@ void tft_draw_fast_h_line(int x, int y, int w, uint16_t color) {
     if (x + w > s_width) w = s_width - x;
     if (w <= 0) return;
 
+    tft_spi_lock();
     tft_set_addr_window(x, y, x + w - 1, y);
     uint8_t byte_h = (color >> 8) & 0xFF;
     uint8_t byte_l = color & 0xFF;
@@ -392,8 +407,9 @@ void tft_draw_fast_h_line(int x, int y, int w, uint16_t color) {
         int chunk = (remaining > 32) ? 32 : remaining;
         tft_send_data(line_buf, chunk * 2);
         remaining -= chunk;
-    }
+    }    tft_spi_unlock();
 }
+
 
 void tft_draw_fast_v_line(int x, int y, int h, uint16_t color) {
     if (x < 0 || x >= s_width || y >= s_height) return;
@@ -401,6 +417,7 @@ void tft_draw_fast_v_line(int x, int y, int h, uint16_t color) {
     if (y + h > s_height) h = s_height - y;
     if (h <= 0) return;
 
+    tft_spi_lock();
     tft_set_addr_window(x, y, x, y + h - 1);
     uint8_t byte_h = (color >> 8) & 0xFF;
     uint8_t byte_l = color & 0xFF;
@@ -416,8 +433,9 @@ void tft_draw_fast_v_line(int x, int y, int h, uint16_t color) {
         int chunk = (remaining > 32) ? 32 : remaining;
         tft_send_data(line_buf, chunk * 2);
         remaining -= chunk;
-    }
+    }    tft_spi_unlock();
 }
+
 
 void tft_fill_rect(int x, int y, int w, int h, uint16_t color) {
     if (x >= s_width || y >= s_height) return;
@@ -427,12 +445,13 @@ void tft_fill_rect(int x, int y, int w, int h, uint16_t color) {
     if (y + h > s_height) h = s_height - y;
     if (w <= 0 || h <= 0) return;
 
+    tft_spi_lock();
     tft_set_addr_window(x, y, x + w - 1, y + h - 1);
     uint8_t byte_h = (color >> 8) & 0xFF;
     uint8_t byte_l = color & 0xFF;
 
     // Fast block fill buffer (256 pixels / 512 bytes)
-    static uint8_t block[512];
+    static DMA_ATTR uint8_t block[512];
     for (int i = 0; i < 512; i += 2) {
         block[i] = byte_h;
         block[i + 1] = byte_l;
@@ -443,8 +462,9 @@ void tft_fill_rect(int x, int y, int w, int h, uint16_t color) {
         int count = (total_pixels > 256) ? 256 : total_pixels;
         tft_send_data(block, count * 2);
         total_pixels -= count;
-    }
+    }    tft_spi_unlock();
 }
+
 
 void tft_fill_screen(uint16_t color) {
     tft_fill_rect(0, 0, s_width, s_height, color);
@@ -460,6 +480,7 @@ void tft_draw_raw_pixels(int x, int y, int w, int h, const uint8_t *data) {
     if (!data || w <= 0 || h <= 0) return;
     if (x < 0 || y < 0 || x + w > s_width || y + h > s_height) return;
 
+    tft_spi_lock();
     tft_set_addr_window(x, y, x + w - 1, y + h - 1);
 
     // Send all pixel data in one large SPI transfer (no byte-swap needed here —
@@ -472,22 +493,36 @@ void tft_draw_raw_pixels(int x, int y, int w, int h, const uint8_t *data) {
         if (chunk > 512) chunk = 512;
         tft_send_data(data + sent, chunk);
         sent += chunk;
-    }
+    }    tft_spi_unlock();
 }
 
+
+static size_t s_stream_pixel = 0;
 void tft_stream_image_start(void) {
-    tft_set_addr_window(0, 0, s_width - 1, s_height - 1);
+    tft_spi_lock();
+    s_stream_pixel = 0;
+    tft_spi_unlock();
 }
 
 void tft_stream_image_chunk(const uint8_t *data, size_t len) {
-    if (!data || len == 0) return;
-    size_t sent = 0;
-    while (sent < len) {
-        size_t chunk = len - sent;
-        if (chunk > 512) chunk = 512;
-        tft_send_data(data + sent, (int)chunk);
-        sent += chunk;
+    if (!data || len == 0 || (len & 1)) return;
+    tft_spi_lock();
+    if (s_stream_pixel + len / 2 > (size_t)s_width * s_height) {
+        tft_spi_unlock();
+        return;
     }
+    while (len > 0) {
+        int x = s_stream_pixel % s_width;
+        int y = s_stream_pixel / s_width;
+        size_t pixels = len / 2;
+        if (pixels > (size_t)(s_width - x)) pixels = s_width - x;
+        tft_set_addr_window(x, y, x + pixels - 1, y);
+        tft_send_data(data, pixels * 2);
+        data += pixels * 2;
+        len -= pixels * 2;
+        s_stream_pixel += pixels;
+    }
+    tft_spi_unlock();
 }
 
 void tft_draw_rect(int x, int y, int w, int h, uint16_t color) {

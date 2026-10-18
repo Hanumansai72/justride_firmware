@@ -6,6 +6,8 @@
 #include "esp_err.h"
 #include "display_tft.h"
 #include "touch.h"
+#include <stddef.h>
+bool display_map_packet(const uint8_t *packet, size_t len);
 
 // =============================================================================
 // GESTURE EVENT TYPE
@@ -98,6 +100,7 @@ typedef enum {
     SCREEN_SETTINGS,
     SCREEN_BRIGHTNESS,
     SCREEN_OTA,
+    SCREEN_MUSIC,
     SCREEN_COUNT
 } screen_id_t;
 
@@ -172,6 +175,13 @@ void display_handle_touch_event(int16_t start_x, int16_t start_y,
 /** Update real-time clock (called by rtc_time.c) */
 void display_set_time(uint8_t hours, uint8_t minutes);
 
+typedef struct {
+    uint8_t state, actions, volume;
+    char title[41];
+    char artist[33];
+} media_state_t;
+void display_update_media(const media_state_t *state);
+
 /** Update live BLE connection status indicator */
 void display_set_ble_status(bool connected);
 
@@ -180,6 +190,7 @@ void display_update_navigation(const navigation_data_t *nav_data);
 
 /** Push dynamic 500m sliding route window geometry */
 void display_update_route_segment(const route_segment_t *seg);
+void display_begin_route_revision(void);
 void display_update_nav_context(const nav_context_t *context);
 
 
@@ -216,17 +227,17 @@ void display_clear(void);
 /**
  * @brief Begin direct image streaming. Switches screen to Image View and opens full-screen window.
  */
-void display_start_image_stream(void);
+bool display_start_image_stream(void);
 
 /**
  * @brief Push a stream chunk of RGB565 pixels directly into the display's GRAM.
  */
-void display_write_image_chunk(const uint8_t *chunk, size_t len);
+bool display_write_image_chunk(const uint8_t *chunk, size_t len);
 
 /**
  * @brief Finalize image stream and draw UI controls over the image.
  */
-void display_finish_image_stream(void);
+bool display_finish_image_stream(void);
 
 /** Show the stored user image screen (called on SWIPE RIGHT gesture). */
 void display_show_user_image(void);
