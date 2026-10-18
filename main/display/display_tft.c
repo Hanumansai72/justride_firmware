@@ -580,6 +580,12 @@ void tft_fill_circle(int x0, int y0, int r, uint16_t color) {
     }
 }
 
+void tft_draw_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint16_t color) {
+    tft_draw_line(x0, y0, x1, y1, color);
+    tft_draw_line(x1, y1, x2, y2, color);
+    tft_draw_line(x2, y2, x0, y0, color);
+}
+
 void tft_fill_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint16_t color) {
     int a, b, y, last;
     if (y0 > y1) { int t=y0; y0=y1; y1=t; t=x0; x0=x1; x1=t; }
@@ -623,6 +629,128 @@ void tft_fill_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint16_t 
 }
 
 // =============================================================================
+// ROUNDED RECTANGLE & ARC PRIMITIVES
+// =============================================================================
+
+static void draw_circle_helper(int x0, int y0, int r, uint8_t cornername, uint16_t color) {
+    int f = 1 - r;
+    int ddF_x = 1;
+    int ddF_y = -2 * r;
+    int x = 0;
+    int y = r;
+
+    while (x < y) {
+        if (f >= 0) {
+            y--;
+            ddF_y += 2;
+            f += ddF_y;
+        }
+        x++;
+        ddF_x += 2;
+        f += ddF_x;
+        if (cornername & 0x4) { // Top-Left
+            tft_draw_pixel(x0 - x, y0 - y, color);
+            tft_draw_pixel(x0 - y, y0 - x, color);
+        }
+        if (cornername & 0x2) { // Top-Right
+            tft_draw_pixel(x0 + x, y0 - y, color);
+            tft_draw_pixel(x0 + y, y0 - x, color);
+        }
+        if (cornername & 0x8) { // Bottom-Left
+            tft_draw_pixel(x0 - x, y0 + y, color);
+            tft_draw_pixel(x0 - y, y0 + x, color);
+        }
+        if (cornername & 0x1) { // Bottom-Right
+            tft_draw_pixel(x0 + x, y0 + y, color);
+            tft_draw_pixel(x0 + y, y0 + x, color);
+        }
+    }
+}
+
+static void fill_circle_helper(int x0, int y0, int r, uint8_t cornername, int delta, uint16_t color) {
+    int f = 1 - r;
+    int ddF_x = 1;
+    int ddF_y = -2 * r;
+    int x = 0;
+    int y = r;
+
+    while (x < y) {
+        if (f >= 0) {
+            y--;
+            ddF_y += 2;
+            f += ddF_y;
+        }
+        x++;
+        ddF_x += 2;
+        f += ddF_x;
+
+        if (cornername & 0x1) {
+            tft_draw_fast_v_line(x0 + x, y0 - y, 2 * y + 1 + delta, color);
+            tft_draw_fast_v_line(x0 + y, y0 - x, 2 * x + 1 + delta, color);
+        }
+        if (cornername & 0x2) {
+            tft_draw_fast_v_line(x0 - x, y0 - y, 2 * y + 1 + delta, color);
+            tft_draw_fast_v_line(x0 - y, y0 - x, 2 * x + 1 + delta, color);
+        }
+    }
+}
+
+void tft_draw_round_rect(int x, int y, int w, int h, int r, uint16_t color) {
+    if (w <= 0 || h <= 0) return;
+    if (r <= 0) {
+        tft_draw_rect(x, y, w, h, color);
+        return;
+    }
+    if (r > w / 2) r = w / 2;
+    if (r > h / 2) r = h / 2;
+
+    tft_draw_fast_h_line(x + r, y, w - 2 * r, color);
+    tft_draw_fast_h_line(x + r, y + h - 1, w - 2 * r, color);
+    tft_draw_fast_v_line(x, y + r, h - 2 * r, color);
+    tft_draw_fast_v_line(x + w - 1, y + r, h - 2 * r, color);
+
+    draw_circle_helper(x + r, y + r, r, 0x4, color);
+    draw_circle_helper(x + w - r - 1, y + r, r, 0x2, color);
+    draw_circle_helper(x + w - r - 1, y + h - r - 1, r, 0x1, color);
+    draw_circle_helper(x + r, y + h - r - 1, r, 0x8, color);
+}
+
+void tft_fill_round_rect(int x, int y, int w, int h, int r, uint16_t color) {
+    if (w <= 0 || h <= 0) return;
+    if (r <= 0) {
+        tft_fill_rect(x, y, w, h, color);
+        return;
+    }
+    if (r > w / 2) r = w / 2;
+    if (r > h / 2) r = h / 2;
+
+    tft_fill_rect(x + r, y, w - 2 * r, h, color);
+    fill_circle_helper(x + w - r - 1, y + r, r, 0x1, h - 2 * r - 1, color);
+    fill_circle_helper(x + r, y + r, r, 0x2, h - 2 * r - 1, color);
+}
+
+void tft_draw_arc(int cx, int cy, int r_out, int r_in, float start_deg, float end_deg, uint16_t color) {
+    if (r_out <= r_in || r_in <= 0) return;
+    float step = 1.0f;
+    if (start_deg > end_deg) {
+        float tmp = start_deg;
+        start_deg = end_deg;
+        end_deg = tmp;
+    }
+
+    for (float deg = start_deg; deg <= end_deg; deg += step) {
+        float rad = deg * (3.14159265f / 180.0f);
+        float cos_v = cosf(rad);
+        float sin_v = sinf(rad);
+        int x_in  = cx + (int)roundf((float)r_in * cos_v);
+        int y_in  = cy + (int)roundf((float)r_in * sin_v);
+        int x_out = cx + (int)roundf((float)r_out * cos_v);
+        int y_out = cy + (int)roundf((float)r_out * sin_v);
+        tft_draw_line(x_in, y_in, x_out, y_out, color);
+    }
+}
+
+// =============================================================================
 // SCALABLE VECTOR TURN ARROW RENDERING
 // =============================================================================
 
@@ -638,15 +766,19 @@ void tft_draw_turn_arrow(int cx, int cy, int size, nav_direction_t direction, ui
             break;
 
         case NAV_DIR_LEFT:
-            // 90-degree Left Arrow
-            tft_fill_triangle(cx - half, cy, cx, cy - half, cx, cy + half, color);
-            tft_fill_rect(cx, cy - stem_w / 2, half, stem_w, color);
+            // Smooth Curved 90-degree Left Arrow (Automotive Cockpit HUD)
+            tft_fill_rect(cx + 2, cy - 2, 6, half + 2, color);
+            tft_fill_circle(cx + 2, cy - 2, 3, color);
+            tft_draw_thick_line(cx + 2, cy - 2, cx - half + 9, cy - 2, 6, color);
+            tft_fill_triangle(cx - half - 2, cy - 2, cx - half + 9, cy - 10, cx - half + 9, cy + 6, color);
             break;
 
         case NAV_DIR_RIGHT:
-            // 90-degree Right Arrow
-            tft_fill_triangle(cx + half, cy, cx, cy - half, cx, cy + half, color);
-            tft_fill_rect(cx - half, cy - stem_w / 2, half, stem_w, color);
+            // Smooth Curved 90-degree Right Arrow (Automotive Cockpit HUD)
+            tft_fill_rect(cx - 7, cy - 2, 6, half + 2, color);
+            tft_fill_circle(cx - 2, cy - 2, 3, color);
+            tft_draw_thick_line(cx - 2, cy - 2, cx + half - 9, cy - 2, 6, color);
+            tft_fill_triangle(cx + half + 2, cy - 2, cx + half - 9, cy - 10, cx + half - 9, cy + 6, color);
             break;
 
         case NAV_DIR_SLIGHT_LEFT:

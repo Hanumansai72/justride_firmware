@@ -59,6 +59,26 @@ bool time_is_synchronized(void)
     return s_time_synced;
 }
 
+void time_get_date_str(char *buf, size_t buf_len)
+{
+    if (!buf || buf_len < 16) return;
+    time_t now;
+    time(&now);
+    struct tm tm_info;
+    localtime_r(&now, &tm_info);
+
+    static const char *const s_wday_names[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
+    static const char *const s_mon_names[]  = {"JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+                                               "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"};
+
+    int wday = (tm_info.tm_wday >= 0 && tm_info.tm_wday <= 6) ? tm_info.tm_wday : 3;
+    int mon  = (tm_info.tm_mon >= 0 && tm_info.tm_mon <= 11) ? tm_info.tm_mon : 8;
+    int year = (tm_info.tm_year > 0) ? (tm_info.tm_year + 1900) : 2026;
+    int mday = (tm_info.tm_mday >= 1 && tm_info.tm_mday <= 31) ? tm_info.tm_mday : 9;
+
+    snprintf(buf, buf_len, "%s, %02d %s %04d", s_wday_names[wday], mday, s_mon_names[mon], year);
+}
+
 // Background FreeRTOS task: runs once every second.
 // Whenever the minute advances, it updates the display live.
 static void rtc_clock_task(void *pvParameters)

@@ -41,6 +41,11 @@ void time_set_epoch(uint32_t epoch_seconds);
  */
 bool time_is_synchronized(void);
 
+/**
+ * @brief Get the current system date string formatted as e.g. "WED, 09 SEP 2026".
+ */
+void time_get_date_str(char *buf, size_t buf_len);
+
 #ifdef __cplusplus
 }
 #endif

@@ -42,6 +42,10 @@ esp_err_t ota_start(uint32_t image_size)
 {
     ESP_LOGI(TAG, "OTA Start requested. Total size: %" PRIu32 " bytes", image_size);
 
+    if (s_ota_status == OTA_STATUS_READY || s_ota_status == OTA_STATUS_RECEIVING) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     // 1. Identify the inactive target partition
     s_running_partition = esp_ota_get_running_partition();
     s_update_partition = esp_ota_get_next_update_partition(NULL);
@@ -51,9 +55,16 @@ esp_err_t ota_start(uint32_t image_size)
         s_ota_status = OTA_STATUS_ERROR_FLASH_WRITE;
         return ESP_ERR_NOT_FOUND;
     }
+    if (image_size == 0 || image_size > s_update_partition->size) {
+        s_ota_status = OTA_STATUS_ERROR_VALIDATION_FAIL;
+        return ESP_ERR_INVALID_SIZE;
+    }
 
     ESP_LOGI(TAG, "Writing OTA update to partition '%s' at offset 0x%08" PRIx32,
              s_update_partition->label, s_update_partition->address);
+
+    // Show progress before esp_ota_begin erases flash, which can take time.
+    display_show_ota_screen(0);
 
     // 3. Begin OTA partition erase & prepare handle
     esp_err_t err = esp_ota_begin(s_update_partition, OTA_WITH_SEQUENTIAL_WRITES, &s_ota_handle);
@@ -66,10 +77,6 @@ esp_err_t ota_start(uint32_t image_size)
     s_total_image_size = image_size;
     s_received_bytes = 0;
     s_ota_status = OTA_STATUS_READY;
-
-    // Show the OTA updating screen immediately so the user knows
-    // firmware is being written (works for both USB flash and BLE OTA)
-    display_show_ota_screen(0);
 
     ESP_LOGI(TAG, "OTA partition ready. Awaiting binary data chunks...");
     return ESP_OK;
@@ -89,6 +96,8 @@ esp_err_t ota_write_chunk(uint32_t offset, const uint8_t *data, uint16_t length)
     esp_err_t err = esp_ota_write(s_ota_handle, (const void *)data, length);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_write failed at offset %" PRIu32 ": %s", offset, esp_err_to_name(err));
+        esp_ota_abort(s_ota_handle);
+        s_ota_handle = 0;
         s_ota_status = OTA_STATUS_ERROR_FLASH_WRITE;
         return err;
     }
@@ -105,9 +114,21 @@ esp_err_t ota_write_chunk(uint32_t offset, const uint8_t *data, uint16_t length)
 esp_err_t ota_finish(void)
 {
     ESP_LOGI(TAG, "OTA Finish requested. Verifying %" PRIu32 " bytes...", s_received_bytes);
+    if (s_ota_status != OTA_STATUS_RECEIVING ||
+        s_received_bytes != s_total_image_size) {
+        ESP_LOGE(TAG, "Incomplete OTA image: %" PRIu32 "/%" PRIu32 " bytes",
+                 s_received_bytes, s_total_image_size);
+        if (s_ota_handle != 0) {
+            esp_ota_abort(s_ota_handle);
+            s_ota_handle = 0;
+        }
+        s_ota_status = OTA_STATUS_ERROR_VALIDATION_FAIL;
+        return ESP_ERR_INVALID_SIZE;
+    }
     s_ota_status = OTA_STATUS_VERIFYING;
 
     esp_err_t err = esp_ota_end(s_ota_handle);
+    s_ota_handle = 0;
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_end verification failed: %s", esp_err_to_name(err));
         s_ota_status = OTA_STATUS_ERROR_VALIDATION_FAIL;

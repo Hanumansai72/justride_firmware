@@ -27,7 +27,6 @@
 #include "rtc_time.h"
 #include "ota.h"
 #include "display.h"
-#include "battery.h"
 
 static const char *TAG = "BLE";
 
@@ -73,6 +72,7 @@ static const char *TAG = "BLE";
 #define NAV_OP_RESET                     0x0E
 #define NAV_OP_NOTIFICATION              0x0F
 #define NAV_OP_DIAGNOSTICS               0x10
+#define NAV_OP_CONTEXT                   0x11
 
 // Image Control OpCodes
 #define IMG_CMD_START                    0x01
@@ -99,6 +99,8 @@ static uint16_t s_ota_status_val_handle = 0;
 static uint16_t s_img_status_val_handle = 0;
 static uint16_t s_nav_status_val_handle = 0;
 static bool s_is_connected = false;
+static uint8_t s_ota_last_reported_pct = 0;
+static uint16_t s_ota_expected_seq = 0;
 static uint8_t s_own_addr_type;
 static TimerHandle_t s_adv_timer = NULL;
 
@@ -177,17 +179,50 @@ static int ble_time_chr_access(uint16_t conn_handle, uint16_t attr_handle,
         ESP_LOGI(TAG, "BLE time sync packet received (%d bytes)", copied_len);
 
         int h = 0, m = 0, s = 0;
+        // 1. ASCII format: "HH:MM:SS" or "HH:MM"
         if (sscanf((char *)buf, "%d:%d:%d", &h, &m, &s) >= 2 ||
             sscanf((char *)buf, "%d:%d", &h, &m) >= 2) {
+            ESP_LOGI(TAG, "RTC synchronized from ASCII: %02d:%02d:%02d", h, m, s);
             time_set_current_time((uint8_t)h, (uint8_t)m, (uint8_t)s);
             return 0;
         }
 
-        if (copied_len >= 2 && copied_len <= 3) {
-            time_set_current_time(buf[0], buf[1], (copied_len == 3) ? buf[2] : 0);
-            return 0;
+        // 2. Standard Bluetooth SIG Current Time Service (CTS) binary format (7-10 bytes)
+        // Byte 0-1: Year (uint16_t LE), Byte 2: Month, Byte 3: Day, Byte 4: Hour, Byte 5: Min, Byte 6: Sec
+        if (copied_len >= 7 && copied_len <= 10) {
+            uint8_t h_bin = buf[4];
+            uint8_t m_bin = buf[5];
+            uint8_t s_bin = buf[6];
+            if (h_bin < 24 && m_bin < 60 && s_bin < 60) {
+                ESP_LOGI(TAG, "RTC synchronized from CTS binary: %02d:%02d:%02d", h_bin, m_bin, s_bin);
+                time_set_current_time(h_bin, m_bin, s_bin);
+                return 0;
+            }
         }
 
+        // 3. Unix epoch timestamp (4 bytes uint32 LE)
+        if (copied_len == 4) {
+            uint32_t epoch = (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) |
+                             ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
+            if (epoch > 1700000000) {
+                time_set_epoch(epoch);
+                return 0;
+            }
+        }
+
+        // 4. Raw 2 or 3 bytes binary: [HH, MM] or [HH, MM, SS]
+        if (copied_len >= 2 && copied_len <= 3) {
+            uint8_t raw_h = buf[0];
+            uint8_t raw_m = buf[1];
+            uint8_t raw_s = (copied_len == 3) ? buf[2] : 0;
+            if (raw_h < 24 && raw_m < 60 && raw_s < 60) {
+                ESP_LOGI(TAG, "RTC synchronized from raw bytes: %02d:%02d:%02d", raw_h, raw_m, raw_s);
+                time_set_current_time(raw_h, raw_m, raw_s);
+                return 0;
+            }
+        }
+
+        ESP_LOGW(TAG, "Unrecognized time sync format (%d bytes)", copied_len);
         return 0;
     } else if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
         time_t now;
@@ -232,9 +267,11 @@ static int ble_ota_control_access(uint16_t conn_handle, uint16_t attr_handle,
             ESP_LOGI(TAG, "OTA CMD: START (Size: %" PRIu32 " bytes)", image_size);
             esp_err_t err = ota_start(image_size);
             if (err == ESP_OK) {
-                display_show_ota_screen(0); // Switch 2.8" TFT directly to Firmware Flash screen
+                s_ota_last_reported_pct = 0;
+                s_ota_expected_seq = 0;
                 ble_ota_notify_status(OTA_STATUS_READY, 0);
             } else {
+                display_set_screen(SCREEN_HOME);
                 ble_ota_notify_status(OTA_STATUS_ERROR_FLASH_WRITE, 0);
             }
             return 0;
@@ -247,6 +284,7 @@ static int ble_ota_control_access(uint16_t conn_handle, uint16_t attr_handle,
                 display_show_ota_screen(100);
                 ble_ota_notify_status(OTA_STATUS_SUCCESS, 100);
             } else {
+                display_set_screen(SCREEN_HOME);
                 ble_ota_notify_status(OTA_STATUS_ERROR_VALIDATION_FAIL, ota_get_progress_percent());
             }
             return 0;
@@ -261,6 +299,10 @@ static int ble_ota_control_access(uint16_t conn_handle, uint16_t attr_handle,
         }
 
         case OTA_CMD_REBOOT: {
+            if (ota_get_status() != OTA_STATUS_SUCCESS) {
+                ESP_LOGW(TAG, "Ignoring OTA reboot: update has not been verified");
+                return BLE_ATT_ERR_UNLIKELY;
+            }
             ESP_LOGI(TAG, "OTA CMD: REBOOT. Restarting into new firmware...");
             display_show_ota_screen(100);
             vTaskDelay(pdMS_TO_TICKS(500));
@@ -283,24 +325,35 @@ static int ble_ota_data_access(uint16_t conn_handle, uint16_t attr_handle,
         uint8_t chunk_buf[512];
         uint16_t len = 0;
         int rc = ble_hs_mbuf_to_flat(ctxt->om, chunk_buf, sizeof(chunk_buf), &len);
-        if (rc != 0 || len == 0) return BLE_ATT_ERR_UNLIKELY;
+        if (rc != 0 || len < 3) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
 
         // Sequence number in first 2 bytes (Little-Endian)
         uint16_t seq = (uint16_t)chunk_buf[0] | ((uint16_t)chunk_buf[1] << 8);
         const uint8_t *payload = &chunk_buf[2];
         uint16_t payload_len = len - 2;
 
-        esp_err_t err = ota_write_chunk((uint32_t)seq, payload, payload_len);
-        if (err != ESP_OK) {
-            ble_ota_notify_status(OTA_STATUS_ERROR_FLASH_WRITE, ota_get_progress_percent());
+        // A retry after a lost ATT response must not write the same bytes twice.
+        if (s_ota_expected_seq > 0 && seq == (uint16_t)(s_ota_expected_seq - 1)) {
+            return 0;
+        }
+        if (seq != s_ota_expected_seq) {
+            ESP_LOGW(TAG, "Unexpected OTA chunk sequence: got %u, expected %u",
+                     seq, s_ota_expected_seq);
             return BLE_ATT_ERR_UNLIKELY;
         }
 
+        esp_err_t err = ota_write_chunk((uint32_t)seq, payload, payload_len);
+        if (err != ESP_OK) {
+            display_set_screen(SCREEN_HOME);
+            ble_ota_notify_status(OTA_STATUS_ERROR_FLASH_WRITE, ota_get_progress_percent());
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+        s_ota_expected_seq++;
+
         // Send periodic progress notifications and refresh screen progress (every ~2%)
-        static uint8_t last_reported_pct = 0;
         uint8_t current_pct = ota_get_progress_percent();
-        if (current_pct >= last_reported_pct + 2 || current_pct == 100) {
-            last_reported_pct = current_pct;
+        if (current_pct >= s_ota_last_reported_pct + 2 || current_pct == 100) {
+            s_ota_last_reported_pct = current_pct;
             display_show_ota_screen(current_pct);
             ble_ota_notify_status(OTA_STATUS_RECEIVING, current_pct);
         }
@@ -551,14 +604,65 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
         nav_data.is_navigating = (strstr(maneuver_str, "ARRIVE") == NULL);
         strncpy(nav_data.current_street, street_str[0] ? street_str : "Motorcycle Route", sizeof(nav_data.current_street) - 1);
 
-        if (eta_secs >= 60) {
-            uint16_t eta_mins = (uint16_t)((eta_secs / 60) > 9999 ? 9999 : (eta_secs / 60));
-            snprintf(nav_data.eta_time_str, sizeof(nav_data.eta_time_str), "%u min", (unsigned)eta_mins);
-        } else {
-            snprintf(nav_data.eta_time_str, sizeof(nav_data.eta_time_str), "< 1 min");
+        char next_maneuver_str[32] = {0};
+        char next_street_str[32] = {0};
+        uint32_t next_maneuver_dist = 0;
+
+        char *p_nman = strstr((char *)rx_buf, "\"nextManeuver\":");
+        if (p_nman) sscanf(p_nman, "\"nextManeuver\":\"%31[^\"]\"", next_maneuver_str);
+
+        char *p_ndist = strstr((char *)rx_buf, "\"nextManeuverDistance\":");
+        if (p_ndist) sscanf(p_ndist, "\"nextManeuverDistance\":%" PRIu32, &next_maneuver_dist);
+
+        char *p_nst = strstr((char *)rx_buf, "\"nextStreet\":");
+        if (p_nst) sscanf(p_nst, "\"nextStreet\":\"%31[^\"]\"", next_street_str);
+
+        nav_data.next_direction = NAV_DIR_NONE;
+        if (next_maneuver_str[0]) {
+            if (strstr(next_maneuver_str, "LEFT")) {
+                nav_data.next_direction = strstr(next_maneuver_str, "SHARP") ? NAV_DIR_SHARP_LEFT :
+                                          strstr(next_maneuver_str, "SLIGHT") ? NAV_DIR_SLIGHT_LEFT : NAV_DIR_LEFT;
+            } else if (strstr(next_maneuver_str, "RIGHT")) {
+                nav_data.next_direction = strstr(next_maneuver_str, "SHARP") ? NAV_DIR_SHARP_RIGHT :
+                                          strstr(next_maneuver_str, "SLIGHT") ? NAV_DIR_SLIGHT_RIGHT : NAV_DIR_RIGHT;
+            } else if (strstr(next_maneuver_str, "U_TURN") || strstr(next_maneuver_str, "UTURN")) {
+                nav_data.next_direction = NAV_DIR_UTURN;
+            } else if (strstr(next_maneuver_str, "ROUNDABOUT")) {
+                nav_data.next_direction = NAV_DIR_ROUNDABOUT;
+            } else if (strstr(next_maneuver_str, "EXIT")) {
+                nav_data.next_direction = NAV_DIR_EXIT;
+            } else if (strstr(next_maneuver_str, "MERGE")) {
+                nav_data.next_direction = NAV_DIR_MERGE;
+            } else if (strstr(next_maneuver_str, "FORK")) {
+                nav_data.next_direction = NAV_DIR_FORK;
+            } else if (strstr(next_maneuver_str, "ARRIVE") || strstr(next_maneuver_str, "REACHED")) {
+                nav_data.next_direction = NAV_DIR_REACHED;
+            } else {
+                nav_data.next_direction = NAV_DIR_STRAIGHT;
+            }
+        }
+        nav_data.next_distance_meters = next_maneuver_dist;
+        strncpy(nav_data.next_street, next_street_str[0] ? next_street_str : "Continue Straight", sizeof(nav_data.next_street) - 1);
+
+        if (nav_data.is_navigating && nav_data.next_direction == NAV_DIR_NONE) {
+            if (nav_data.remaining_dist_km > 0.0f && nav_data.remaining_dist_km <= 0.4f) {
+                nav_data.next_direction = NAV_DIR_REACHED;
+                nav_data.next_distance_meters = (uint32_t)(nav_data.remaining_dist_km * 1000.0f);
+                strncpy(nav_data.next_street, "Destination", sizeof(nav_data.next_street) - 1);
+            } else {
+                uint32_t total_rem_m = (uint32_t)(nav_data.remaining_dist_km * 1000.0f);
+                nav_data.next_distance_meters = (total_rem_m > nav_data.distance_meters) ? (total_rem_m - nav_data.distance_meters) : 1200;
+                nav_data.next_direction = NAV_DIR_STRAIGHT;
+                strncpy(nav_data.next_street, "Continue Straight", sizeof(nav_data.next_street) - 1);
+            }
         }
 
         display_update_navigation(&nav_data);
+        if (nav_data.is_navigating && display_get_current_screen() != SCREEN_NAV) {
+            ESP_LOGI(TAG, "Active navigation (JSON) -> switching to SCREEN_NAV (current=%d)",
+                     display_get_current_screen());
+            display_set_screen(SCREEN_NAV);
+        }
         return 0;
     }
 
@@ -571,7 +675,7 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
             ESP_LOGI(TAG, "BLE Remote: Set Brightness -> %d%%", b_pct);
             display_set_brightness(b_pct);
             return 0;
-        } else if (op == NAV_OP_RESTART) {
+        } else if (op == NAV_OP_RESTART && len == 1) {
             ESP_LOGW(TAG, "BLE Remote: Restart requested from App");
             ble_disconnect_and_restart();
             return 0;
@@ -617,23 +721,41 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
             return 0;
         } else if (op == NAV_OP_DIAGNOSTICS) {
             ESP_LOGI(TAG, "BLE Remote: Diagnostics self-test requested from App");
-            int batt_pct = battery_get_percentage();
-            float batt_v = battery_get_voltage();
-            bool is_chg = battery_is_charging();
-            uint8_t v_deci = (batt_v > 0) ? (uint8_t)(batt_v * 10.0f) : 41;
-
             uint8_t diag_buf[7] = {
                 NAV_STATUS_DIAGNOSTICS, // 0x10
                 1,                      // Bluetooth link OK
                 1,                      // GPS status OK
                 1,                      // Display TFT 320x240 OK
-                (uint8_t)(batt_pct >= 0 ? batt_pct : 85),
-                is_chg ? 1 : 0,
-                v_deci
+                100,                    // Power / Battery status OK (100%)
+                0,                      // Power source (External / Not charging)
+                42                      // 4.2V nominal (deci-volts)
             };
             ble_nav_notify_diagnostic_packet(diag_buf, sizeof(diag_buf));
             return 0;
         }
+    }
+
+    // Optional low-rate city and nearby place context (OpCode 0x11).
+    if (len >= 10 && rx_buf[0] == NAV_OP_CONTEXT) {
+        size_t city_len = rx_buf[1];
+        if (city_len > 18 || len < 10 + city_len) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        size_t offset = 2 + city_len;
+        size_t name_len = rx_buf[offset + 7];
+        if (name_len > 18 || len < offset + 8 + name_len)
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        nav_context_t context;
+        memset(&context, 0, sizeof(context));
+        memcpy(context.city, &rx_buf[2], city_len);
+        context.poi_type = rx_buf[offset];
+        context.poi_distance_m = (uint16_t)rx_buf[offset + 1] |
+                                 ((uint16_t)rx_buf[offset + 2] << 8);
+        context.poi_x = (uint16_t)rx_buf[offset + 3] |
+                        ((uint16_t)rx_buf[offset + 4] << 8);
+        context.poi_y = (uint16_t)rx_buf[offset + 5] |
+                        ((uint16_t)rx_buf[offset + 6] << 8);
+        memcpy(context.poi_name, &rx_buf[offset + 8], name_len);
+        display_update_nav_context(&context);
+        return 0;
     }
 
     // 3. Route Segment packet format (OpCode 0x0B)
@@ -645,6 +767,12 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
             memset(&seg, 0, sizeof(seg));
             seg.count = count;
             seg.is_destination_visible = (rx_buf[2] & 0x01) != 0;
+            seg.completed_segment_count = (rx_buf[2] >> 1) & 0x0f;
+            if (seg.completed_segment_count >= count)
+                seg.completed_segment_count = count ? count - 1 : 0;
+            seg.progress_percent = len > (size_t)(7 + count * 4)
+                ? rx_buf[7 + count * 4] : 0;
+            if (seg.progress_percent > 100) seg.progress_percent = 100;
             seg.dest_x = (uint16_t)rx_buf[3] | ((uint16_t)rx_buf[4] << 8);
             seg.dest_y = (uint16_t)rx_buf[5] | ((uint16_t)rx_buf[6] << 8);
             size_t offset = 7;
@@ -739,12 +867,45 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
             snprintf(nav_data.eta_time_str, sizeof(nav_data.eta_time_str), "< 1 min");
         }
 
-        // A real route start owns the HUD.  Do this once at NAV_START rather
-        // than forcing the navigation page on every live update, so a rider
-        // can still deliberately view media or settings while navigating.
+        // Lookahead / Secondary maneuver parsing
+        size_t next_offset = (len >= 21 ? 21 : 18) + text_len;
+        if (len >= next_offset + 3) {
+            uint8_t next_man = rx_buf[next_offset];
+            uint16_t next_dist = (uint16_t)rx_buf[next_offset + 1] | ((uint16_t)rx_buf[next_offset + 2] << 8);
+            char next_street_buf[32] = {0};
+            if (len >= next_offset + 4) {
+                uint8_t next_txt_len = rx_buf[next_offset + 3];
+                if (next_txt_len > 0 && len >= next_offset + 4 + next_txt_len) {
+                    int copy_n = (next_txt_len < 31) ? next_txt_len : 31;
+                    memcpy(next_street_buf, &rx_buf[next_offset + 4], copy_n);
+                    next_street_buf[copy_n] = '\0';
+                }
+            }
+            nav_data.next_direction = ble_code_to_nav_direction(next_man);
+            nav_data.next_distance_meters = next_dist;
+            strncpy(nav_data.next_street, next_street_buf[0] ? next_street_buf : "Continue Straight", sizeof(nav_data.next_street) - 1);
+        } else {
+            // Intelligent lookahead fallback when packet does not carry secondary turn extension
+            if (nav_data.is_navigating) {
+                if (nav_data.remaining_dist_km > 0.0f && nav_data.remaining_dist_km <= 0.4f) {
+                    nav_data.next_direction = NAV_DIR_REACHED;
+                    nav_data.next_distance_meters = (uint32_t)(nav_data.remaining_dist_km * 1000.0f);
+                    strncpy(nav_data.next_street, "Destination", sizeof(nav_data.next_street) - 1);
+                } else {
+                    uint32_t total_rem_m = (uint32_t)(nav_data.remaining_dist_km * 1000.0f);
+                    nav_data.next_distance_meters = (total_rem_m > nav_data.distance_meters) ? (total_rem_m - nav_data.distance_meters) : 1200;
+                    nav_data.next_direction = NAV_DIR_STRAIGHT;
+                    strncpy(nav_data.next_street, "Continue Straight", sizeof(nav_data.next_street) - 1);
+                }
+            }
+        }
+
+        // A real route start owns the HUD. Switch to SCREEN_NAV whenever
+        // active navigation is running so the rider immediately sees turn directions.
         display_update_navigation(&nav_data);
-        if ((opcode == NAV_OP_START && nav_data.is_navigating) ||
-            (nav_data.is_navigating && display_get_current_screen() == SCREEN_HOME)) {
+        if (nav_data.is_navigating && (opcode == NAV_OP_START || display_get_current_screen() != SCREEN_NAV)) {
+            ESP_LOGI(TAG, "Active navigation (Binary Op=0x%02X) -> switching to SCREEN_NAV (current=%d)",
+                     opcode, display_get_current_screen());
             display_set_screen(SCREEN_NAV);
         }
         return 0;
@@ -976,14 +1137,14 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
             display_set_ble_status(true);
 
             // Update BLE connection parameters for resilient background link stability:
-            // 6000ms supervision timeout prevents Android from dropping connection
-            // when user switches to Google Maps / shares location.
+            // A longer supervision timeout tolerates brief Android pauses while
+            // opening a shared destination or switching between apps.
             struct ble_gap_upd_params conn_params;
             memset(&conn_params, 0, sizeof(conn_params));
             conn_params.itvl_min = 24;            // 30 ms (24 * 1.25ms)
             conn_params.itvl_max = 40;            // 50 ms (40 * 1.25ms)
             conn_params.latency = 0;              // Low latency for snappy turn instructions
-            conn_params.supervision_timeout = 600; // 6000 ms (600 * 10ms)
+            conn_params.supervision_timeout = 2000; // 20000 ms (2000 * 10ms)
             conn_params.min_ce_len = 0;
             conn_params.max_ce_len = 0;
             ble_gap_update_params(s_conn_handle, &conn_params);
@@ -1003,6 +1164,11 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_DISCONNECT:
         s_is_connected = false;
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        if (ota_get_status() == OTA_STATUS_READY ||
+            ota_get_status() == OTA_STATUS_RECEIVING) {
+            ota_abort();
+            display_set_screen(SCREEN_HOME);
+        }
         ESP_LOGW(TAG, "Phone disconnected! Reason=0x%04X (%d). Resuming advertising in 120ms...",
                  event->disconnect.reason, event->disconnect.reason);
         display_set_ble_status(false);

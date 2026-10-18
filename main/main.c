@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include "esp_log.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -9,6 +10,7 @@
 #include "ble.h"
 #include "ota.h"
 #include "buttons.h"
+#include "mpu6500.h"
 
 static const char *TAG = "JUSTRIDE_MAIN";
 
@@ -138,6 +140,7 @@ static void touch_task(void *pvParam) {
 
 void app_main(void)
 {
+    ESP_LOGI(TAG, "Boot reset reason: %d", (int)esp_reset_reason());
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "       JustRide Motorcycle Device       ");
     ESP_LOGI(TAG, "     2.8\" TFT SPI HUD & Dual OTA       ");
@@ -172,9 +175,16 @@ void app_main(void)
     ble_init();
 
     // --------------------------------------------------
-    // STEP 6: Boot Rollback Self-Test Confirmation
+    // STEP 6: MPU6500 IMU — Gyro-based turn arrow rotation
+    // GPIO 21 = SDA, GPIO 22 = SCL, NCS pulled to 3.3V
     // --------------------------------------------------
-    ota_confirm_boot_valid();
+    esp_err_t imu_ret = mpu6500_init();
+    if (imu_ret == ESP_OK) {
+        mpu6500_start_task(); // Launches 50 Hz yaw integration -> display arrow
+    } else {
+        ESP_LOGW(TAG, "MPU6500 init failed (%s) - IMU arrow rotation disabled",
+                 esp_err_to_name(imu_ret));
+    }
 
     // Launch background touch input monitoring task
     xTaskCreate(touch_task, "touch_task", 3072, NULL, 5, NULL);
@@ -192,6 +202,10 @@ void app_main(void)
     display_update_navigation(&initial_nav);
 
     ESP_LOGI(TAG, "All subsystems running. 2.8\" HUD operational.");
+
+    // Keep rollback available if the new image fails during initial startup.
+    vTaskDelay(pdMS_TO_TICKS(10000));
+    ota_confirm_boot_valid();
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));

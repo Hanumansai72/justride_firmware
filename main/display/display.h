@@ -36,11 +36,22 @@ typedef struct {
 
 typedef struct {
     uint8_t count;
+    uint8_t completed_segment_count;
+    uint8_t progress_percent;
     bool is_destination_visible;
     uint16_t dest_x;
     uint16_t dest_y;
     route_point_t points[ROUTE_MAX_POINTS];
 } route_segment_t;
+
+typedef struct {
+    char city[19];
+    uint8_t poi_type;
+    uint16_t poi_distance_m;
+    uint16_t poi_x;
+    uint16_t poi_y;
+    char poi_name[19];
+} nav_context_t;
 
 typedef struct {
     nav_direction_t direction;    // Turn direction enum
@@ -55,6 +66,9 @@ typedef struct {
     bool rerouting;               // Route recalculation flag
     uint16_t maneuver_id;         // Unique identifier for current maneuver
     uint8_t maneuver_state;       // Maneuver state (0:NONE, 1:STRAIGHT, 2:APPROACHING, 3:PREVIEW, 4:ACTIVE, 5:COMPLETED)
+    nav_direction_t next_direction; // Lookahead / Secondary upcoming maneuver direction enum
+    uint32_t next_distance_meters;  // Distance for next maneuver (meters)
+    char next_street[32];           // Next maneuver description / street name (e.g. "Continue Straight", "MG Road")
 } navigation_data_t;
 
 
@@ -76,11 +90,10 @@ typedef enum {
 } nav_zoom_level_t;
 
 // =============================================================================
-// 5 Screen Identifiers
+// Screen Identifiers
 typedef enum {
     SCREEN_HOME = 0,
     SCREEN_NAV,
-    SCREEN_MUSIC,
     SCREEN_PICTURE,
     SCREEN_SETTINGS,
     SCREEN_BRIGHTNESS,
@@ -101,15 +114,14 @@ void display_show_splash(void);
 /** Screen Show Functions */
 void display_show_home_screen(void);
 void display_show_main_screen(void);       // Screen 1: Navigation
-void display_show_music_screen(void);      // Screen 2: Music
-void display_show_user_image(void);        // Screen 3: Picture / Gallery
-void display_show_settings_screen(void);   // Screen 4: Settings
+void display_show_user_image(void);        // Screen 2: Picture / Gallery
+void display_show_settings_screen(void);   // Screen 3: Settings
 void display_show_brightness_screen(void); // Dedicated Brightness Control Screen
 
 /** Show Firmware Flash / OTA Updating screen with live percentage */
 void display_show_ota_screen(uint8_t progress_pct);
 
-/** Switch screen state: 0=Home, 1=Nav, 2=Music, 3=Picture, 4=Settings */
+/** Switch screen state: 0=Home, 1=Nav, 2=Picture, 3=Settings */
 void display_set_screen(uint8_t screen_id);
 uint8_t display_get_current_screen(void);
 
@@ -121,8 +133,29 @@ void display_prev_screen(void);
 void display_set_brightness(uint8_t brightness_pct);
 uint8_t display_get_brightness(void);
 
+/** Display power management: turn screen backlight and rendering on/off */
+void display_set_power(bool on);
+bool display_get_power(void);
+
 /** Update live vehicle speed (km/h) */
 void display_set_speed(uint16_t speed_kmh);
+
+/**
+ * @brief Update the IMU-derived heading from MPU6500 gyro integration.
+ *        When the bike physically turns left or right, this heading causes
+ *        the navigation turn arrow on the HUD to rotate accordingly.
+ *        ONLY modifies the IMU overlay — does NOT change BLE/GPS nav state.
+ * @param heading_deg  Integrated yaw heading in degrees [0..360)
+ */
+void display_set_imu_heading(float heading_deg);
+
+/**
+ * @brief Directly set the IMU arrow override direction on the HUD.
+ *        Supports NAV_DIR_STRAIGHT (Forward), NAV_DIR_UTURN (Backward),
+ *        NAV_DIR_LEFT, NAV_DIR_RIGHT, or NAV_DIR_NONE (Level/Route).
+ * @param dir  Navigation direction override
+ */
+void display_set_imu_override_direction(nav_direction_t dir);
 
 /**
  * @brief Process a completed gesture event from the FSM touch engine.
@@ -136,10 +169,7 @@ void display_handle_touch_event(int16_t start_x, int16_t start_y,
                                 int16_t end_x,   int16_t end_y,
                                 touch_gesture_t gesture);
 
-/** Battery percentage API — stub retained for ABI compatibility (battery.c module removed) */
-void display_set_battery(uint8_t percentage);
-
-/** Update real-time clock on status bar (called by rtc_time.c) */
+/** Update real-time clock (called by rtc_time.c) */
 void display_set_time(uint8_t hours, uint8_t minutes);
 
 /** Update live BLE connection status indicator */
@@ -150,6 +180,7 @@ void display_update_navigation(const navigation_data_t *nav_data);
 
 /** Push dynamic 500m sliding route window geometry */
 void display_update_route_segment(const route_segment_t *seg);
+void display_update_nav_context(const nav_context_t *context);
 
 
 /** Show the latest notification popup on the display (replaces any previous notification) */

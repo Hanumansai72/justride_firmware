@@ -57,6 +57,9 @@ extern "C" {
 #define COLOR_DARKGREY      0x39E7  // Dark Grey #383838
 #define COLOR_LIGHTGREY     0xC618  // Light Grey #C6C6C6
 #define COLOR_RED           0xFFFF  // White (Monochrome High Contrast)
+#define COLOR_SIGN_RED      0xF800  // Pure Bright Red for Speed Badge
+#define COLOR_DARK_STRIP    0x18C3  // Dark Charcoal Road Strip (#181818)
+#define COLOR_CROSS_STREET  0x632C  // Dim Grey for Branch Street Lines
 #define COLOR_GREEN         0xFFFF  // White (Monochrome High Contrast)
 #define COLOR_PRIMARY_GREEN 0xFFFF  // Pure White in Black & White mode
 #define COLOR_AMBER         0xC618  // Light Grey (Monochrome Warning)
@@ -65,6 +68,17 @@ extern "C" {
 #define COLOR_SURFACE_DARK  0x0000  // Pure Black background
 #define COLOR_CARD_BG       0x0000  // Pure Black card background
 #define COLOR_CARD_BORDER   0x39E7  // Subtle dark grey card border
+#define COLOR_NEON_GREEN    0x274E  // Vibrant Neon / Electric Green #22E875 (RGB565)
+#define COLOR_JUST_GREEN    0x3FE8  // Vivid JustRide Green #39FF68 (RGB565)
+#define COLOR_MAP_BG        0x08A3  // Deep Slate Map Background #08151D
+#define COLOR_MAP_ROAD      0x21AC  // Dark Slate Road Surface #263640
+#define COLOR_HUD_PANEL     0x0882  // Deep Dark Panel Background #0B1419
+#define COLOR_HUD_BORDER    0x19A6  // Subtle Slate Panel Border #183038
+#define COLOR_MUTED_TEXT    0xADBD  // Slate Secondary Text #AAB7BE
+#define COLOR_SPEED_LIMIT_RED 0xF800// Vibrant Speed Limit Ring Red
+#define COLOR_SPLASH_DARK   0x0841  // Deep Charcoal #0A0A0A
+#define COLOR_SPLASH_BAR_BG 0x2965  // Dark Charcoal progress bar track #2B2F38
+#define COLOR_SPLASH_TOPO   0x18E3  // Subtle dark grey topographic elevation contour #1A1F26
 
 // Turn Direction Enum for Navigation
 typedef enum {
@@ -102,6 +116,11 @@ void tft_draw_circle(int x0, int y0, int r, uint16_t color);
 void tft_fill_circle(int x0, int y0, int r, uint16_t color);
 void tft_draw_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint16_t color);
 void tft_fill_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint16_t color);
+
+// Rounded Rectangles & Gauges
+void tft_draw_round_rect(int x, int y, int w, int h, int r, uint16_t color);
+void tft_fill_round_rect(int x, int y, int w, int h, int r, uint16_t color);
+void tft_draw_arc(int cx, int cy, int r_out, int r_in, float start_deg, float end_deg, uint16_t color);
 
 // Text & Glyph functions
 void tft_draw_char(int x, int y, char c, uint16_t fg_color, uint16_t bg_color, uint8_t scale);
