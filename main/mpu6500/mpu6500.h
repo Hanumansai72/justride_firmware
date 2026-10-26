@@ -117,6 +117,13 @@ bool mpu6500_is_gyro_available(void);
 
 /** Returns true after the stationary startup baseline has completed. */
 bool mpu6500_is_calibration_complete(void);
+bool mpu6500_is_available(void);
+const char *mpu6500_get_status(void);
+/** Queue calibration on the sensor task, never block the touch/render task. */
+bool mpu6500_request_calibration(void);
+void mpu6500_begin_ride_calibration(void);
+void mpu6500_end_ride_calibration(void);
+void mpu6500_publish_status(void);
 
 /**
  * @brief Get the active classified physical motion direction.

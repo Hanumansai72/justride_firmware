@@ -136,10 +136,6 @@ void display_prev_screen(void);
 void display_set_brightness(uint8_t brightness_pct);
 uint8_t display_get_brightness(void);
 
-/** Display power management: turn screen backlight and rendering on/off */
-void display_set_power(bool on);
-bool display_get_power(void);
-
 /** Update live vehicle speed (km/h) */
 void display_set_speed(uint16_t speed_kmh);
 
@@ -195,6 +191,8 @@ void display_update_nav_context(const nav_context_t *context);
 
 
 /** Show the latest notification popup on the display (replaces any previous notification) */
+void display_update_call(uint8_t state,uint8_t actions,const char *caller);
+void display_show_app_notification(const char *app,const char *title,const char *message);
 void display_show_notification(const char *title, const char *message);
 
 /** Dismiss the currently active notification popup immediately */
@@ -225,17 +223,17 @@ void display_clear(void);
 // =============================================================================
 
 /**
- * @brief Begin direct image streaming. Switches screen to Image View and opens full-screen window.
+ * @brief Prepare image storage and open Image View through the UI lock.
  */
 bool display_start_image_stream(void);
 
 /**
- * @brief Push a stream chunk of RGB565 pixels directly into the display's GRAM.
+ * @brief Store RGB565 bytes in flash without touching the currently visible page.
  */
 bool display_write_image_chunk(const uint8_t *chunk, size_t len);
 
 /**
- * @brief Finalize image stream and draw UI controls over the image.
+ * @brief Commit the stored image and request a redraw if Image View is still open.
  */
 bool display_finish_image_stream(void);
 

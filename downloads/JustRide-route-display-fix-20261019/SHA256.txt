@@ -1,0 +1,1 @@
+12af1fb203696ccc797219d4dff345727d0bd2cd6a91f38ca458dd644c73ff23  justride_firmware.bin

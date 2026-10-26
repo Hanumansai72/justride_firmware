@@ -375,7 +375,42 @@ void tft_set_rotation(uint8_t rotation) {
 // PRIMITIVE DRAWING IMPLEMENTATIONS
 // =============================================================================
 
+// One reusable 5 KiB strip, not a screen framebuffer. The owning task draws
+// complete pixels into RAM; other SPI clients remain behind the recursive lock.
+static DMA_ATTR uint8_t s_hud_strip[320*8*2];
+static struct { int x,y,w,h; TaskHandle_t owner; } s_tile;
+static bool tile_active(void) {
+    return s_tile.owner && s_tile.owner==xTaskGetCurrentTaskHandle();
+}
+static void tile_fill(int x,int y,int w,int h,uint16_t color) {
+    int right=x+w,bottom=y+h;
+    if(x<s_tile.x)x=s_tile.x;
+    if(y<s_tile.y)y=s_tile.y;
+    if(right>s_tile.x+s_tile.w)right=s_tile.x+s_tile.w;
+    if(bottom>s_tile.y+s_tile.h)bottom=s_tile.y+s_tile.h;
+    for(int yy=y;yy<bottom;yy++)for(int xx=x;xx<right;xx++) {
+        unsigned at=((yy-s_tile.y)*s_tile.w+xx-s_tile.x)*2;
+        s_hud_strip[at]=color>>8;s_hud_strip[at+1]=color&255;
+    }
+}
+void tft_draw_buffered_region(int x,int y,int w,int h,uint16_t background,
+                             void (*draw)(void *),void *context) {
+    if(!draw || w<=0 || w>320 || h<=0 || x<0 || y<0 || x+w>s_width || y+h>s_height)return;
+    tft_spi_lock();
+    for(int offset=0;offset<h;offset+=8) {
+        int rows=h-offset>8?8:h-offset;
+        s_tile.x=x;s_tile.y=y+offset;s_tile.w=w;s_tile.h=rows;
+        s_tile.owner=xTaskGetCurrentTaskHandle();
+        tile_fill(x,y+offset,w,rows,background);
+        draw(context);
+        s_tile.owner=NULL;
+        tft_draw_raw_pixels(x,y+offset,w,rows,s_hud_strip);
+    }
+    tft_spi_unlock();
+}
+
 void tft_draw_pixel(int x, int y, uint16_t color) {
+    if(tile_active()){tile_fill(x,y,1,1,color);return;}
     if (x < 0 || x >= s_width || y < 0 || y >= s_height) return;
     tft_spi_lock();
     tft_set_addr_window(x, y, x, y);
@@ -386,6 +421,7 @@ void tft_draw_pixel(int x, int y, uint16_t color) {
 
 
 void tft_draw_fast_h_line(int x, int y, int w, uint16_t color) {
+    if(tile_active()){tile_fill(x,y,w,1,color);return;}
     if (y < 0 || y >= s_height || x >= s_width) return;
     if (x < 0) { w += x; x = 0; }
     if (x + w > s_width) w = s_width - x;
@@ -412,6 +448,7 @@ void tft_draw_fast_h_line(int x, int y, int w, uint16_t color) {
 
 
 void tft_draw_fast_v_line(int x, int y, int h, uint16_t color) {
+    if(tile_active()){tile_fill(x,y,1,h,color);return;}
     if (x < 0 || x >= s_width || y >= s_height) return;
     if (y < 0) { h += y; y = 0; }
     if (y + h > s_height) h = s_height - y;
@@ -438,6 +475,7 @@ void tft_draw_fast_v_line(int x, int y, int h, uint16_t color) {
 
 
 void tft_fill_rect(int x, int y, int w, int h, uint16_t color) {
+    if(tile_active()){tile_fill(x,y,w,h,color);return;}
     if (x >= s_width || y >= s_height) return;
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
@@ -478,6 +516,15 @@ void tft_fill_screen(uint16_t color) {
 // =============================================================================
 void tft_draw_raw_pixels(int x, int y, int w, int h, const uint8_t *data) {
     if (!data || w <= 0 || h <= 0) return;
+    if(tile_active()) {
+        int left=x>s_tile.x?x:s_tile.x,top=y>s_tile.y?y:s_tile.y;
+        int right=x+w<s_tile.x+s_tile.w?x+w:s_tile.x+s_tile.w;
+        int bottom=y+h<s_tile.y+s_tile.h?y+h:s_tile.y+s_tile.h;
+        if(right>left)for(int yy=top;yy<bottom;yy++)
+            memcpy(s_hud_strip+((yy-s_tile.y)*s_tile.w+left-s_tile.x)*2,
+                   data+((yy-y)*w+left-x)*2,(right-left)*2);
+        return;
+    }
     if (x < 0 || y < 0 || x + w > s_width || y + h > s_height) return;
 
     tft_spi_lock();
@@ -896,6 +943,26 @@ void tft_draw_turn_arrow(int cx, int cy, int size, nav_direction_t direction, ui
 void tft_draw_char(int x, int y, char c, uint16_t fg_color, uint16_t bg_color, uint8_t scale) {
     if (c < 32 || c > 126) c = ' ';
     int font_idx = c - 32;
+
+    // Send a complete glyph instead of 40 separate address-window writes.
+    // A screen cleared during a swipe must not sit black while text is drawn.
+    if (scale >= 1 && scale <= 4 && bg_color != fg_color &&
+        x >= 0 && y >= 0 && x + 5 * scale <= s_width && y + 8 * scale <= s_height) {
+        static DMA_ATTR uint8_t glyph[5 * 8 * 4 * 4 * 2];
+        tft_spi_lock();
+        int offset = 0;
+        for (int row = 0; row < 8 * scale; row++) {
+            for (int col = 0; col < 5 * scale; col++) {
+                uint16_t color = font5x8[font_idx][col / scale] & (1 << (row / scale))
+                    ? fg_color : bg_color;
+                glyph[offset++] = color >> 8;
+                glyph[offset++] = color & 0xff;
+            }
+        }
+        tft_draw_raw_pixels(x, y, 5 * scale, 8 * scale, glyph);
+        tft_spi_unlock();
+        return;
+    }
 
     for (int col = 0; col < 5; col++) {
         uint8_t line = font5x8[font_idx][col];

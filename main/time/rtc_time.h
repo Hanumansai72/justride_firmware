@@ -12,10 +12,17 @@ extern "C" {
 #endif
 
 /**
- * @brief Initialize the Real-Time Clock engine and start the background FreeRTOS
- *        task that automatically updates the display clock every minute.
+ * @brief Restore the last saved calendar time from NVS before display startup,
+ *        then update the clock and checkpoint to flash each minute.
  */
 esp_err_t time_init(void);
+
+/** Save the current full calendar time to flash for the next boot. */
+void time_save_checkpoint(void);
+
+/** Set a complete local calendar date/time from Bluetooth CTS. Reject invalid dates. */
+bool time_set_datetime(uint16_t year, uint8_t month, uint8_t day,
+                       uint8_t hours, uint8_t minutes, uint8_t seconds);
 
 /**
  * @brief Set the RTC time directly (e.g. from phone sync or manual input).
@@ -37,7 +44,7 @@ void time_set_epoch(uint32_t epoch_seconds);
 /**
  * @brief Check whether the time has been synchronized with the phone.
  *
- * @return true if synchronized, false if using default boot time
+ * @return true if synchronized or restored from a valid saved clock
  */
 bool time_is_synchronized(void);
 

@@ -9,7 +9,6 @@
 #include "rtc_time.h"
 #include "ble.h"
 #include "ota.h"
-#include "buttons.h"
 #include "mpu6500.h"
 
 static const char *TAG = "JUSTRIDE_MAIN";
@@ -36,6 +35,7 @@ static const char *TAG = "JUSTRIDE_MAIN";
 #define SWIPE_MIN_PX       40   // 40 px minimum horizontal displacement for swipes
 #define TAP_MAX_PX         28   // Max movement (px) still classified as a tap (forgiving for finger rolls)
 #define DEBOUNCE_TICKS      1   // 1 tick (20ms) = immediate touch response
+#define RELEASE_CONFIRM_TICKS 3 // Ignore up to two noisy/edge samples during a swipe
 
 typedef enum {
     GESTURE_IDLE = 0,
@@ -52,6 +52,8 @@ static void touch_task(void *pvParam) {
     int16_t  last_y         = 0;
     uint32_t press_ms       = 0;
     int      confirm_count  = 0;   // Debounce counter
+    int      release_count  = 0;
+    int      max_dx = 0, max_dy = 0;
 
     while (1) {
         bool is_down = touch_get_point(&pt);
@@ -68,6 +70,8 @@ static void touch_task(void *pvParam) {
                         start_y      = pt.y;
                         last_x       = pt.x;
                         last_y       = pt.y;
+                        max_dx = 0;
+                        max_dy = 0;
                         press_ms     = xTaskGetTickCount() * portTICK_PERIOD_MS;
                         state        = GESTURE_PRESSED;
                         confirm_count = 0;
@@ -81,9 +85,16 @@ static void touch_task(void *pvParam) {
             // -----------------------------------------------------------------
             case GESTURE_PRESSED:
                 if (is_down) {
+                    release_count = 0;
                     last_x = pt.x;
                     last_y = pt.y;
+                    if (abs(pt.x - start_x) > max_dx) max_dx = abs(pt.x - start_x);
+                    if (abs(pt.y - start_y) > max_dy) max_dy = abs(pt.y - start_y);
                 } else {
+                    // One noisy/edge sample is not a finger release. Splitting
+                    // a swipe into taps can accidentally activate controls.
+                    if (++release_count < RELEASE_CONFIRM_TICKS) break;
+                    release_count = 0;
                     // Finger lifted — compute gesture
                     int16_t dx = last_x - start_x;
                     int16_t dy = last_y - start_y;
@@ -113,14 +124,9 @@ static void touch_task(void *pvParam) {
                         ESP_LOGI(TAG, "GESTURE: SWIPE UP (dy=%d, start_y=%d)", dy, start_y);
                         display_handle_touch_event(start_x, start_y, last_x, last_y, TOUCH_GESTURE_SWIPE_UP);
 
-                    } else if (abs(dx) <= TAP_MAX_PX && abs(dy) <= TAP_MAX_PX) {
+                    } else if (max_dx <= TAP_MAX_PX && max_dy <= TAP_MAX_PX) {
                         // ✅ TAP
                         ESP_LOGI(TAG, "GESTURE: TAP at (%d, %d)", start_x, start_y);
-                        display_handle_touch_event(start_x, start_y, start_x, start_y, TOUCH_GESTURE_TAP);
-
-                    } else if (abs(dx) < SWIPE_MIN_PX && abs(dy) < SWIPE_MIN_PX) {
-                        // Small movement that didn't meet full swipe threshold -> treat as tap at start position
-                        ESP_LOGI(TAG, "GESTURE: Short Drag fallback to TAP at (%d, %d)", start_x, start_y);
                         display_handle_touch_event(start_x, start_y, start_x, start_y, TOUCH_GESTURE_TAP);
 
                     } else {
@@ -151,6 +157,9 @@ void app_main(void)
     // --------------------------------------------------
     ota_init();
 
+    // Restore the saved calendar before any home-screen frame is drawn.
+    ESP_ERROR_CHECK(time_init());
+
     // --------------------------------------------------
     // STEP 2: 2.8" SPI TFT & Touch Initialization
     // --------------------------------------------------
@@ -160,17 +169,7 @@ void app_main(void)
     display_show_splash();
 
     // --------------------------------------------------
-    // STEP 3: Real-Time Clock Engine
-    // --------------------------------------------------
-    ESP_ERROR_CHECK(time_init());
-
-    // --------------------------------------------------
-    // STEP 4: Physical Push-buttons
-    // --------------------------------------------------
-    ESP_ERROR_CHECK(buttons_init());
-
-    // --------------------------------------------------
-    // STEP 5: BLE Stack & Real-Time Sync
+    // STEP 4: BLE Stack & Real-Time Sync
     // --------------------------------------------------
     // Initial HUD state: Ready for Ride / Awaiting Google Navigation over BLE
     navigation_data_t initial_nav = {
@@ -188,7 +187,7 @@ void app_main(void)
     ble_init();
 
     // --------------------------------------------------
-    // STEP 6: MPU6500 IMU — Gyro-based turn arrow rotation
+    // STEP 5: MPU6500 IMU — Gyro-based turn arrow rotation
     // GPIO 21 = SDA, GPIO 22 = SCL, NCS pulled to 3.3V
     // --------------------------------------------------
     esp_err_t imu_ret = mpu6500_init();

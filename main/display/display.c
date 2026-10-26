@@ -1,4 +1,6 @@
+#include "mpu6500.h"
 #include "map_frame.h"
+#include "hud_ui.h"
 #include "display.h"
 #include "freertos/queue.h"
 #include "esp_heap_caps.h"
@@ -31,6 +33,18 @@ static uint8_t s_time_hours = 14;
 static uint8_t s_time_minutes = 5;
 static bool s_ble_connected = false;
 static bool s_phone_state_ready = false;
+typedef struct { uint8_t state,actions; char caller[48]; } call_info_t;
+static call_info_t s_call;
+static bool s_call_painted;
+static QueueHandle_t s_call_queue;
+static StaticQueue_t s_call_queue_storage;
+static uint8_t s_call_queue_bytes[sizeof(call_info_t)];
+void display_update_call(uint8_t state,uint8_t actions,const char *caller) {
+  if(!s_call_queue)return;
+  call_info_t call={.state=state,.actions=actions};
+  snprintf(call.caller,sizeof(call.caller),"%s",caller?caller:"");
+  xQueueOverwrite(s_call_queue,&call);
+}
 static uint16_t s_speed_kmh =
     0; // Live vehicle speed (km/h) — 0 when stationary
 
@@ -58,6 +72,7 @@ static bool s_nav_interrupted = false;
 typedef struct {
   char title[32];
   char message[64];
+  char app[24];
   bool active;
 } notification_info_t;
 
@@ -66,6 +81,8 @@ static notification_info_t s_latest_notif = {
     .message = "",
     .active = false,
 };
+static bool s_notif_dirty = true;
+static int64_t s_notif_started_us;
 static TimerHandle_t s_notif_timer = NULL;
 static volatile bool s_notif_dismiss_requested;
 
@@ -143,11 +160,7 @@ static route_segment_t s_route_seg = {
 };
 static nav_context_t s_nav_context = {0};
 static bool s_route_seg_dirty = true;
-static nav_direction_t s_last_marker_dir = NAV_DIR_NONE;
-static route_segment_t s_drawn_route_seg = {0};
-static nav_context_t s_drawn_nav_context = {0};
 static bool s_map_drawn = false;
-static nav_zoom_level_t s_drawn_map_zoom;
 
 // Navigation Camera & Zoom Engine
 static nav_camera_mode_t s_camera_mode = NAV_CAMERA_FOLLOW;
@@ -194,9 +207,6 @@ typedef struct {
   bool
       last_show_maneuver_junction; // Whether maneuver junction was drawn (<30m)
   uint32_t last_corridor_dist_m;   // Distance when road corridor was last drawn
-  nav_direction_t last_next_dir;   // Secondary maneuver arrow enum
-  uint32_t last_next_dist_m;       // Secondary distance in meters
-  char last_next_street[32];       // Secondary instruction / street name
 } nav_hud_cache_t;
 
 static nav_hud_cache_t s_hud = {
@@ -207,9 +217,6 @@ static nav_hud_cache_t s_hud = {
     .last_arrow_color = 0,
     .last_turn_instruction = {0},
     .last_street = {0},
-    .last_next_dir = (nav_direction_t)0xFF,
-    .last_next_dist_m = 0xFFFFFFFF,
-    .last_next_street = {0},
     .last_dist_rem = {0},
     .last_eta = {0},
     .last_remaining_dist_km = -1.0f,
@@ -238,14 +245,15 @@ static QueueHandle_t s_connection_queue, s_notification_queue;
 static StaticQueue_t s_connection_queue_storage, s_notification_queue_storage;
 static uint8_t s_connection_queue_bytes[sizeof(bool)];
 static uint8_t s_notification_queue_bytes[sizeof(notification_info_t)];
-static void apply_notification(const char *title, const char *message);
+static void apply_notification(const notification_info_t *notification);
 static StaticQueue_t s_route_queue_storage, s_context_queue_storage;
 static uint8_t s_route_queue_bytes[sizeof(route_segment_t)];
-static uint8_t s_context_queue_bytes[sizeof(nav_context_t)];
+static uint8_t s_context_queue_bytes[4 * sizeof(nav_context_t)];
 static StaticQueue_t s_nav_queue_storage, s_media_queue_storage;
 static uint8_t s_nav_queue_bytes[sizeof(navigation_data_t)];
 static uint8_t s_media_queue_bytes[sizeof(media_state_t)];
-static media_state_t s_media;
+static media_state_t s_media = {.state = 6};
+static bool s_show_motion_settings;
 static bool s_media_dirty = true, s_media_frame = false, s_screen_refresh = false;
 static int64_t s_last_media_command_us;
 static void apply_navigation(const navigation_data_t *nav_data);
@@ -266,7 +274,9 @@ static void render_music(void) {
   s_media_dirty = false;
   tft_fill_rect(8, 40, 304, 190, COLOR_BLACK);
   const char *status = !s_ble_connected ? "PHONE DISCONNECTED" :
-      s_media.state == 0 ? "MEDIA UNSUPPORTED" :
+      s_media.state == 0 ? "ANDROID APP REQUIRED" :
+      s_media.state == 6 ? "WAITING FOR PHONE MEDIA" :
+      s_media.state == 7 ? "RECONNECT PHONE MEDIA" :
       s_media.state == 1 ? "ENABLE NOTIFICATION ACCESS" :
       s_media.state == 2 ? "OPEN A MUSIC APP ON PHONE" :
       s_media.state == 4 ? "PLAYING" : s_media.state == 3 ? "PAUSED" : "PLAYER READY";
@@ -275,16 +285,26 @@ static void render_music(void) {
   snprintf(title, sizeof(title), "%.24s", s_ble_connected ? s_media.title : "");
   tft_draw_string(14, 65, title, COLOR_WHITE, COLOR_BLACK, 2);
   tft_draw_string(14, 91, s_ble_connected ? s_media.artist : "", COLOR_LIGHTGREY, COLOR_BLACK, 1);
-  bool active = s_ble_connected && s_media.state >= 3;
-  uint16_t fg = active ? COLOR_JUST_GREEN : COLOR_DARKGREY;
-  for (int x = 10; x < 300; x += 103) tft_draw_round_rect(x, 118, 94, 60, 8, fg);
-  tft_draw_string_centered(57, 140, "PREV", fg, COLOR_BLACK, 2);
-  tft_draw_string_centered(160, 140, s_media.state == 4 ? "PAUSE" : "PLAY", fg, COLOR_BLACK, 2);
-  tft_draw_string_centered(263, 140, "NEXT", fg, COLOR_BLACK, 2);
-  tft_draw_round_rect(10, 187, 94, 43, 6, fg);
-  tft_draw_round_rect(216, 187, 94, 43, 6, fg);
-  tft_draw_string_centered(57, 200, "VOL -", fg, COLOR_BLACK, 2);
-  tft_draw_string_centered(263, 200, "VOL +", fg, COLOR_BLACK, 2);
+  bool active = s_ble_connected && s_media.state >= 3 && s_media.state <= 5;
+  uint16_t prev_fg = active && (s_media.actions & 8) ? COLOR_JUST_GREEN : COLOR_DARKGREY;
+  uint16_t play_fg = active && (s_media.actions & (s_media.state == 4 ? 2 : 1)) ? COLOR_JUST_GREEN : COLOR_DARKGREY;
+  uint16_t next_fg = active && (s_media.actions & 4) ? COLOR_JUST_GREEN : COLOR_DARKGREY;
+  uint16_t volume_fg = active && (s_media.actions & 16) ? COLOR_JUST_GREEN : COLOR_DARKGREY;
+  tft_draw_round_rect(10,118,94,60,8,prev_fg);
+  tft_draw_round_rect(113,118,94,60,8,play_fg);
+  tft_draw_round_rect(216,118,94,60,8,next_fg);
+  tft_draw_string_centered(57, 140, "PREV", prev_fg, COLOR_BLACK, 2);
+  tft_draw_string_centered(160, 140, s_media.state == 4 ? "PAUSE" : "PLAY", play_fg, COLOR_BLACK, 2);
+  tft_draw_string_centered(263, 140, "NEXT", next_fg, COLOR_BLACK, 2);
+  tft_draw_round_rect(10, 187, 94, 43, 6, volume_fg);
+  tft_draw_round_rect(216, 187, 94, 43, 6, volume_fg);
+  tft_draw_string_centered(57, 200, "VOL -", volume_fg, COLOR_BLACK, 2);
+  tft_draw_string_centered(263, 200, "VOL +", volume_fg, COLOR_BLACK, 2);
+  if (s_ble_connected && !active) {
+    tft_fill_rect(10, 118, 300, 60, COLOR_BLACK);
+    tft_draw_round_rect(10,118,300,60,8,COLOR_JUST_GREEN);
+    tft_draw_string_centered(160,140,s_media.state == 1 ? "ENABLE ON PHONE" : "RETRY MEDIA",COLOR_JUST_GREEN,COLOR_BLACK,1);
+  }
   char volume[12];
   snprintf(volume, sizeof(volume), "%u%%", s_media.volume);
   tft_draw_string_centered(160, 200, volume, COLOR_WHITE, COLOR_BLACK, 2);
@@ -663,318 +683,27 @@ void display_show_home_screen(void) {
   render_notification_banner();
 }
 
-// ── 0. WRONG TURN / REROUTE RECOVERY CARD (Top-Left: X: 4..118, Y: 6..100)
-static void draw_hud_wrong_turn_card(wrong_turn_state_t state) {
-  const int cx_box = 4;
-  const int cy_box = 6;
-  const int cw = 114;
-  const int ch = 94;
+// Native reference composition: 94px left rail, 226x177 map, 59px maneuver panel.
 
-  // Dark rounded rectangular panel
-  tft_fill_round_rect(cx_box, cy_box, cw, ch, 8, COLOR_HUD_PANEL);
 
-  // High-visibility Warning Red / Amber contour
-  tft_draw_round_rect(cx_box, cy_box, cw, ch, 8, COLOR_SIGN_RED);
-  tft_draw_round_rect(cx_box + 1, cy_box + 1, cw - 2, ch - 2, 7,
-                      COLOR_SPEED_LIMIT_RED);
+// Medium maneuver: centered arrow, bounded distance, one instruction line.
 
-  if (state == WRONG_TURN_DETECTED) {
-    // Large U-turn arrow on left
-    tft_draw_turn_arrow(cx_box + 20, cy_box + 32, 26, NAV_DIR_UTURN,
-                        COLOR_WHITE);
 
-    // Warning Header
-    tft_draw_string(cx_box + 38, cy_box + 14, "WRONG TURN", COLOR_SIGN_RED,
-                    COLOR_HUD_PANEL, 1);
 
-    // Bold Action: "Make U-Turn"
-    tft_draw_string(cx_box + 38, cy_box + 28, "Make", COLOR_WHITE,
-                    COLOR_HUD_PANEL, 2);
-    tft_draw_string(cx_box + 38, cy_box + 46, "U-Turn", COLOR_WHITE,
-                    COLOR_HUD_PANEL, 2);
 
-    // Bottom hint
-    tft_draw_fast_h_line(cx_box + 6, cy_box + 68, cw - 12, COLOR_HUD_BORDER);
-    tft_draw_string(cx_box + 10, cy_box + 72, "When safe to turn",
-                    COLOR_MUTED_TEXT, COLOR_HUD_PANEL, 1);
-  } else {
-    // Rerouting in progress
-    tft_fill_circle(cx_box + 20, cy_box + 34, 10, COLOR_HUD_BORDER);
-    tft_draw_circle(cx_box + 20, cy_box + 34, 10, COLOR_WHITE);
-    tft_fill_triangle(cx_box + 20, cy_box + 27, cx_box + 16, cy_box + 34,
-                      cx_box + 24, cy_box + 34, COLOR_NEON_GREEN);
+// Trip footer: fixed columns keep distance and duration from pushing each other.
 
-    tft_draw_string(cx_box + 36, cy_box + 16, "REROUTING", COLOR_WHITE,
-                    COLOR_HUD_PANEL, 1);
-    tft_draw_string(cx_box + 36, cy_box + 30, "Finding", COLOR_NEON_GREEN,
-                    COLOR_HUD_PANEL, 2);
-    tft_draw_string(cx_box + 36, cy_box + 48, "Route...", COLOR_NEON_GREEN,
-                    COLOR_HUD_PANEL, 1);
-
-    tft_draw_fast_h_line(cx_box + 6, cy_box + 68, cw - 12, COLOR_HUD_BORDER);
-    tft_draw_string(cx_box + 10, cy_box + 72, "Updating GPS path",
-                    COLOR_MUTED_TEXT, COLOR_HUD_PANEL, 1);
-  }
-}
-
-// =============================================================================
-// MASTER COCKPIT NAVIGATION HUD RENDERING (Matching Reference Image)
-// 1. Top-Left Primary Turn Instruction Card (with glowing green border, NO road
-// name)
-// 2. Secondary Maneuver ("Then ^ 2.4 km Continue Straight")
-// 3. Wide live route map with a fixed rider marker in heading-up follow mode
-// 4. Compact speed overlay on the map
-// 5. Full-Width Bottom Information Bar (Distance • Duration | ETA in Neon
-// Green)
-// =============================================================================
-
-// ── 1. PRIMARY TURN INSTRUCTION PANEL (Top-Left: X: 4..118, Y: 6..100)
-static void draw_hud_primary_turn_card(nav_direction_t dir, uint32_t dist_m,
-                                       const char *street, uint8_t state) {
-  const int cx_box = 4;
-  const int cy_box = 6;
-  const int cw = 114;
-  const int ch = 94;
-
-  // Dark rounded rectangular panel
-  tft_fill_round_rect(cx_box, cy_box, cw, ch, 8, COLOR_HUD_PANEL);
-
-  // Glowing JustRide green border (double stroke for vivid neon contour)
-  tft_draw_round_rect(cx_box, cy_box, cw, ch, 8, COLOR_NEON_GREEN);
-  tft_draw_round_rect(cx_box + 1, cy_box + 1, cw - 2, ch - 2, 7, 0x1BE5);
-
-  // Large navigation turn arrow on left of card
-  tft_draw_turn_arrow(cx_box + 20, cy_box + 48, 28, dir, COLOR_WHITE);
-
-  // Dynamic distance string
-  char dist_str[10];
-  const char *unit_str = "m";
-  if (dist_m >= 1000) {
-    snprintf(dist_str, sizeof(dist_str), "%.1f", (float)dist_m / 1000.0f);
-    unit_str = "km";
-  } else {
-    snprintf(dist_str, sizeof(dist_str), "%lu", (unsigned long)dist_m);
-    unit_str = "m";
-  }
-
-  // Large bold distance typography (scale 3)
-  tft_draw_string(cx_box + 42, cy_box + 20, dist_str, COLOR_WHITE,
-                  COLOR_HUD_PANEL, 3);
-  int d_len = (int)strlen(dist_str);
-  tft_draw_string(cx_box + 42 + (d_len * 18) + 3, cy_box + 28, unit_str,
-                  COLOR_WHITE, COLOR_HUD_PANEL, 2);
-
-  // Maneuver title text below distance
-  const char *maneuver_lbl = "Continue";
-  switch (dir) {
-  case NAV_DIR_LEFT:
-    maneuver_lbl = "Turn Left";
-    break;
-  case NAV_DIR_RIGHT:
-    maneuver_lbl = "Turn Right";
-    break;
-  case NAV_DIR_SLIGHT_LEFT:
-    maneuver_lbl = "Bear Left";
-    break;
-  case NAV_DIR_SLIGHT_RIGHT:
-    maneuver_lbl = "Bear Right";
-    break;
-  case NAV_DIR_SHARP_LEFT:
-    maneuver_lbl = "Sharp Left";
-    break;
-  case NAV_DIR_SHARP_RIGHT:
-    maneuver_lbl = "Sharp Right";
-    break;
-  case NAV_DIR_UTURN:
-    maneuver_lbl = "U-Turn";
-    break;
-  case NAV_DIR_ROUNDABOUT:
-    maneuver_lbl = "Roundabout";
-    break;
-  case NAV_DIR_EXIT:
-    maneuver_lbl = "Take Exit";
-    break;
-  case NAV_DIR_MERGE:
-    maneuver_lbl = "Merge Ahead";
-    break;
-  case NAV_DIR_FORK:
-    maneuver_lbl = "Keep Route";
-    break;
-  case NAV_DIR_REACHED:
-    maneuver_lbl = "Arrived!";
-    break;
-  default:
-    maneuver_lbl = "Continue Straight";
-    break;
-  }
-
-  tft_draw_string(cx_box + 42, cy_box + 58, maneuver_lbl, COLOR_WHITE,
-                  COLOR_HUD_PANEL, 1);
-
-  // STRICT REQUIREMENT: NO ROAD NAME inside primary turn card (separator and
-  // street removed)
-}
-
-// ── 2. SECONDARY MANEUVER ("Then ^ 2.4 km Continue Straight") (X: 4..118, Y: 104..196)
-static void draw_hud_speed_badge(uint16_t speed_kmh);
-static void draw_hud_secondary_maneuver(nav_direction_t next_dir,
-                                        uint32_t next_dist_m,
-                                        const char *next_street) {
-  const int sx = 4;
-  const int sy = 104;
-  const int sw = 114;
-  const int sh = 92;
-
-  // Dark rounded card with subtle border
-  tft_fill_round_rect(sx, sy, sw, sh, 8, COLOR_HUD_PANEL);
-  tft_draw_round_rect(sx, sy, sw, sh, 8, COLOR_HUD_BORDER);
-
-  if (next_dir == NAV_DIR_NONE) {
-    tft_draw_string(sx + 10, sy + 20, "NO NEXT TURN", COLOR_MUTED_TEXT, COLOR_HUD_PANEL, 1);
-    draw_hud_speed_badge(s_speed_kmh);
-    return;
-  }
-
-  // "Then" prompt
-  tft_draw_string(sx + 10, sy + 10, "Then", COLOR_MUTED_TEXT, COLOR_HUD_PANEL,
-                  1);
-
-  // Dynamic upcoming maneuver arrow (compact size 18 for secondary card)
-  nav_direction_t arrow_dir =
-      (next_dir == NAV_DIR_NONE) ? NAV_DIR_STRAIGHT : next_dir;
-  tft_draw_turn_arrow(sx + 18, sy + 44, 18, arrow_dir, COLOR_WHITE);
-
-  // Secondary distance formatting
-  char d_buf[16];
-  if (next_dist_m >= 10000) {
-    snprintf(d_buf, sizeof(d_buf), "%lu km",
-             (unsigned long)(next_dist_m / 1000));
-  } else if (next_dist_m >= 1000) {
-    snprintf(d_buf, sizeof(d_buf), "%.1f km", (float)next_dist_m / 1000.0f);
-  } else if (next_dist_m > 0) {
-    snprintf(d_buf, sizeof(d_buf), "%lu m", (unsigned long)next_dist_m);
-  } else {
-    snprintf(d_buf, sizeof(d_buf), "-- m");
-  }
-  tft_draw_string(sx + 36, sy + 32, d_buf, COLOR_WHITE, COLOR_HUD_PANEL, 2);
-
-  // Secondary maneuver instruction / street label
-  const char *lbl = next_street;
-  if (!lbl || lbl[0] == '\0') {
-    switch (arrow_dir) {
-    case NAV_DIR_LEFT:
-      lbl = "Turn Left";
-      break;
-    case NAV_DIR_RIGHT:
-      lbl = "Turn Right";
-      break;
-    case NAV_DIR_SLIGHT_LEFT:
-      lbl = "Keep Left";
-      break;
-    case NAV_DIR_SLIGHT_RIGHT:
-      lbl = "Keep Right";
-      break;
-    case NAV_DIR_SHARP_LEFT:
-      lbl = "Sharp Left";
-      break;
-    case NAV_DIR_SHARP_RIGHT:
-      lbl = "Sharp Right";
-      break;
-    case NAV_DIR_UTURN:
-      lbl = "Make U-Turn";
-      break;
-    case NAV_DIR_REACHED:
-      lbl = "Destination";
-      break;
-    case NAV_DIR_ROUNDABOUT:
-      lbl = "Roundabout";
-      break;
-    case NAV_DIR_FORK:
-      lbl = "Keep Route";
-      break;
-    case NAV_DIR_MERGE:
-      lbl = "Merge Ahead";
-      break;
-    default:
-      lbl = "Continue Straight";
-      break;
-    }
-  }
-
-  char clean_lbl[18];
-  strncpy(clean_lbl, lbl, sizeof(clean_lbl) - 1);
-  clean_lbl[sizeof(clean_lbl) - 1] = '\0';
-  tft_draw_string(sx + 10, sy + 54, clean_lbl, COLOR_MUTED_TEXT,
-                  COLOR_HUD_PANEL, 1);
-  draw_hud_speed_badge(s_speed_kmh);
-}
-
-// ── 3. FULL-WIDTH BOTTOM INFORMATION BAR (X: 4..316, Y: 202..236) ────────────
-// [Location Pin] remaining distance • remaining duration
-static void draw_hud_bottom_info_bar(void) {
-  const int bx = 4;
-  const int by = 202;
-  const int bw = 312;
-  const int bh = 34;
-
-  // Dark rounded rectangular pill spanning full display width
-  tft_fill_round_rect(bx, by, bw, bh, 8, COLOR_HUD_PANEL);
-  tft_draw_round_rect(bx, by, bw, bh, 8, COLOR_HUD_BORDER);
-
-  // Location pin icon on left
-  tft_fill_circle(bx + 14, by + 13, 4, COLOR_WHITE);
-  tft_fill_circle(bx + 14, by + 13, 2, COLOR_HUD_PANEL);
-  tft_fill_triangle(bx + 11, by + 14, bx + 17, by + 14, bx + 14, by + 21,
-                    COLOR_WHITE);
-
-  // Remaining distance (dynamic from s_nav.remaining_dist_km)
-  char rem_buf[16];
-  float rem_km = s_nav.remaining_dist_km;
-  snprintf(rem_buf, sizeof(rem_buf), "%.1f km", rem_km);
-  tft_draw_string(bx + 24, by + 12, rem_buf, COLOR_WHITE, COLOR_HUD_PANEL, 1);
-
-  // Bullet separator "•"
-  int rem_w = (int)strlen(rem_buf) * 6;
-  int x_dot = bx + 24 + rem_w + 10;
-  tft_fill_circle(x_dot, by + 16, 2, COLOR_MUTED_TEXT);
-
-  // Duration (dynamic from s_nav.eta_time_str)
-  char dur_buf[16];
-  if (s_nav.eta_time_str[0] && strcmp(s_nav.eta_time_str, "--") != 0) {
-    snprintf(dur_buf, sizeof(dur_buf), "%s", s_nav.eta_time_str);
-  } else {
-    snprintf(dur_buf, sizeof(dur_buf), "--");
-  }
-  int x_dur = x_dot + 10;
-  tft_draw_string(x_dur, by + 12, dur_buf, COLOR_WHITE, COLOR_HUD_PANEL, 1);
-
-  // Vertical divider "|"
-  int dur_w = (int)strlen(dur_buf) * 6;
-  int x_div = x_dur + dur_w + 12;
-  tft_draw_fast_v_line(x_div, by + 8, 18, COLOR_HUD_BORDER);
-
-  // The phone sends remaining duration, not an arrival clock time.
-  int x_eta = x_div + 12;
-  tft_draw_string(x_eta, by + 12, "REMAIN", COLOR_MUTED_TEXT,
-                  COLOR_HUD_PANEL, 1);
-
-  // Compact whole-route progress, based on phone GPS/polyline matching.
-  tft_fill_rect(18, 230, 284, 3, COLOR_NEON_GREEN);
-  int completed_width = 284 * s_route_seg.progress_percent / 100;
-  if (completed_width > 0)
-    tft_fill_rect(18, 230, completed_width, 3, COLOR_BLACK);
-}
 
 // Navigation-map colors are local so the surrounding HUD keeps its theme.
-#define COLOR_NAV_MAP_BG    0x08A9  // Deep navy blue
-#define COLOR_NAV_CYAN_GLOW 0x03D3  // Dim cyan route halo
-#define COLOR_NAV_CYAN      0x073F  // Bright cyan route and pointer
+#define COLOR_NAV_MAP_BG    HUD_BG
+#define COLOR_NAV_ROUTE_HALO JR_PRIMARY_DARK
+#define COLOR_NAV_ROUTE      JR_PRIMARY
 
 // ── 4. ROTATED RIDER CHEVRON (Large Map Area: cx=220, cy=146)
 // ─────────────
 static void draw_hud_rider_chevron(float angle_rad) {
-  const float cx = 220.0f;
-  const float cy = 146.0f;
+  const float cx = 207.0f;
+  const float cy = 148.0f;
   const float cos_a = cosf(angle_rad);
   const float sin_a = sinf(angle_rad);
 
@@ -993,165 +722,109 @@ static void draw_hud_rider_chevron(float angle_rad) {
   int16_t x3 = (int16_t)roundf(cx + (15.0f * cos_a) - (11.0f * sin_a));
   int16_t y3 = (int16_t)roundf(cy + (15.0f * sin_a) + (11.0f * cos_a));
 
-  // Cyan outline and white body match the navigation pointer in the reference.
-  tft_draw_thick_line(x0, y0, x1, y1, 3, COLOR_NAV_CYAN);
-  tft_draw_thick_line(x1, y1, x2, y2, 3, COLOR_NAV_CYAN);
-  tft_draw_thick_line(x2, y2, x3, y3, 3, COLOR_NAV_CYAN);
-  tft_draw_thick_line(x3, y3, x0, y0, 3, COLOR_NAV_CYAN);
+  // Emerald outline and off-white body match the website palette.
+  tft_draw_thick_line(x0, y0, x1, y1, 3, COLOR_NAV_ROUTE);
+  tft_draw_thick_line(x1, y1, x2, y2, 3, COLOR_NAV_ROUTE);
+  tft_draw_thick_line(x2, y2, x3, y3, 3, COLOR_NAV_ROUTE);
+  tft_draw_thick_line(x3, y3, x0, y0, 3, COLOR_NAV_ROUTE);
 
-  // Pure white solid core
+  // High-contrast off-white core
   tft_fill_triangle(x0, y0, x1, y1, x2, y2, COLOR_WHITE);
   tft_fill_triangle(x0, y0, x2, y2, x3, y3, COLOR_WHITE);
 
-  tft_draw_line(x0, y0, x2, y2, COLOR_NAV_CYAN);
+  tft_draw_line(x0, y0, x2, y2, COLOR_NAV_ROUTE);
 }
 
 // ── 5. LARGE HEADING-UP ROUTE MAP (X: 122..319, Y: 4..198)
-static void draw_hud_rider_marker(nav_direction_t dir) {
-  float angle = 0.0f;
-  switch (dir) {
-  case NAV_DIR_SLIGHT_LEFT: angle = -0.35f; break;
-  case NAV_DIR_LEFT: angle = -0.70f; break;
-  case NAV_DIR_SHARP_LEFT: angle = -1.05f; break;
-  case NAV_DIR_SLIGHT_RIGHT: angle = 0.35f; break;
-  case NAV_DIR_RIGHT: angle = 0.70f; break;
-  case NAV_DIR_SHARP_RIGHT: angle = 1.05f; break;
-  case NAV_DIR_UTURN: angle = 3.14f; break;
-  default: break;
+// Visual motion affects only the rider pointer, never the route instruction,
+// GPS speed or map/compass heading. Sampling remains on the 50 Hz sensor task.
+static float rider_motion_degrees(void) {
+  if(!mpu6500_is_available() || !mpu6500_is_calibration_complete())return 0;
+  if(mpu6500_is_gyro_available()) {
+    float angle=mpu6500_get_heading_deg()-s_imu_ref_heading;
+    if(angle>180)angle-=360;
+    if(angle< -180)angle+=360;
+    return angle;
   }
-  // The opaque marker panel keeps the route underneath unchanged when the
-  // IMU changes direction. Only this small rectangle is redrawn.
-  tft_fill_rect(199, 125, 42, 43, COLOR_NAV_MAP_BG);
-  draw_hud_rider_chevron(angle);
-  s_last_marker_dir = dir;
+  if(s_imu_arrow_override==NAV_DIR_UTURN)return 180;
+  if(s_imu_arrow_override==NAV_DIR_NONE || s_imu_arrow_override==NAV_DIR_STRAIGHT)return 0;
+  return fmaxf(-90,fminf(90,mpu6500_get_roll_deg()));
 }
-
+static int s_drawn_motion_degrees=1000;
+typedef struct { int x, y, w, h; } route_region_t;
+static void draw_route_region(void *context);
+static void paint_route_region(int x, int y, int w, int h) {
+  for (int row = y; row < y + h; row += 8) {
+    route_region_t region = {x, row, w, y + h - row > 8 ? 8 : y + h - row};
+    tft_draw_buffered_region(x, row, w, region.h, HUD_BG, draw_route_region, &region);
+  }
+}
+static void draw_hud_rider_marker(nav_direction_t dir) {
+  (void)dir;
+  s_drawn_motion_degrees=(int)lroundf(rider_motion_degrees()/2)*2;
+  // Restore the actual road beneath the marker; never punch a blank hole in it.
+  paint_route_region(184, 125, 47, 47);
+}
 static int route_zoom_percent(void) {
   switch (s_zoom_level) {
-  case NAV_ZOOM_LEVEL_1: return 300;
-  case NAV_ZOOM_LEVEL_2: return 250;
-  case NAV_ZOOM_LEVEL_3: return 175;
-  case NAV_ZOOM_LEVEL_4: return 125;
-  default: return 100;
+  case NAV_ZOOM_LEVEL_1: return 150;
+  case NAV_ZOOM_LEVEL_2: return 100;
+  case NAV_ZOOM_LEVEL_3: return 75;
+  case NAV_ZOOM_LEVEL_4: return 50;
+  default: return 35;
   }
 }
-
 static int16_t route_map_x(uint16_t x) {
-  int zoom_pct = route_zoom_percent();
-  int value = 220 + ((int)x - 160) * 3 * zoom_pct / 400;
-  return (int16_t)(value < 130 ? 130 : (value > 310 ? 310 : value));
+  return 207 + ((int)x - 160) * 9 * route_zoom_percent() / 1000;
 }
-
 static int16_t route_map_y(uint16_t y) {
-  int zoom_pct = route_zoom_percent();
-  int value = 146 + ((int)y - 160) * 3 * zoom_pct / 400;
-  return (int16_t)(value < 38 ? 38 : (value > 191 ? 191 : value));
+  return 148 + ((int)y - 160) * 9 * route_zoom_percent() / 1000;
 }
-
-static void draw_hud_route_lines(const route_segment_t *seg, bool erase) {
-  for (uint8_t i = 1; i < seg->count; i++) {
-    int x0 = route_map_x(seg->points[i - 1].x);
-    int y0 = route_map_y(seg->points[i - 1].y);
-    int x1 = route_map_x(seg->points[i].x);
-    int y1 = route_map_y(seg->points[i].y);
-    if (erase) {
-      tft_draw_thick_line(x0, y0, x1, y1, 11, COLOR_NAV_MAP_BG);
-    } else if (i <= seg->completed_segment_count) {
-      tft_draw_thick_line(x0, y0, x1, y1, 7, COLOR_NAV_CYAN_GLOW);
-      tft_draw_thick_line(x0, y0, x1, y1, 4, COLOR_BLACK);
-    } else {
-      tft_draw_thick_line(x0, y0, x1, y1, 9, COLOR_NAV_CYAN_GLOW);
-      tft_draw_thick_line(x0, y0, x1, y1, 5, COLOR_NAV_CYAN);
-      tft_draw_thick_line(x0, y0, x1, y1, 2, COLOR_WHITE);
-    }
+// Clip whole segments; clamping each endpoint creates false boundary roads.
+static bool clip_route_line(float *x, float *y, float *xx, float *yy,
+                            const route_region_t *r) {
+  float dx=*xx-*x, dy=*yy-*y, lo=0, hi=1;
+  float p[4]={-dx,dx,-dy,dy};
+  float q[4]={*x-r->x+5,r->x+r->w+4-*x,*y-r->y+5,r->y+r->h+4-*y};
+  for(int i=0;i<4;i++) {
+    if(p[i]==0){if(q[i]<0)return false;continue;}
+    float t=q[i]/p[i];
+    if(p[i]<0){if(t>lo)lo=t;}else if(t<hi)hi=t;
+    if(lo>hi)return false;
   }
-  if (seg->count >= 2 && seg->is_destination_visible) {
-    tft_fill_circle(route_map_x(seg->dest_x), route_map_y(seg->dest_y),
-                    erase ? 6 : 5,
-                    erase ? COLOR_NAV_MAP_BG : COLOR_NAV_CYAN);
-  }
+  *xx=*x+hi*dx;*yy=*y+hi*dy;*x+=lo*dx;*y+=lo*dy;
+  return true;
 }
-
+static void draw_route_region(void *context) {
+  const route_region_t *region=context;
+  for(uint8_t i=1;i<s_route_seg.count;i++) {
+    float x=route_map_x(s_route_seg.points[i-1].x), y=route_map_y(s_route_seg.points[i-1].y);
+    float xx=route_map_x(s_route_seg.points[i].x), yy=route_map_y(s_route_seg.points[i].y);
+    if(!clip_route_line(&x,&y,&xx,&yy,region))continue;
+    bool past=i<=s_route_seg.completed_segment_count;
+    tft_draw_thick_line(lroundf(x),lroundf(y),lroundf(xx),lroundf(yy),past?5:7,COLOR_NAV_ROUTE_HALO);
+    tft_draw_thick_line(lroundf(x),lroundf(y),lroundf(xx),lroundf(yy),past?2:4,past?HUD_MUTED:COLOR_NAV_ROUTE);
+    if(!past)tft_draw_thick_line(lroundf(x),lroundf(y),lroundf(xx),lroundf(yy),1,COLOR_WHITE);
+  }
+  if(s_route_seg.count>=2 && s_route_seg.is_destination_visible)
+    tft_fill_circle(route_map_x(s_route_seg.dest_x),route_map_y(s_route_seg.dest_y),4,COLOR_NAV_ROUTE);
+  if(s_route_seg.count<2)hud_text(145,70,"WAITING FOR ROUTE",10,HUD_MUTED,HUD_BG,170);
+  draw_hud_rider_chevron(s_drawn_motion_degrees*0.01745329252f);
+}
 static void draw_hud_road_corridor(nav_direction_t dir, uint32_t dist_m) {
+  (void)dir; (void)dist_m;
   if (map_frame_draw(!s_map_drawn)) {
-    s_map_drawn = true;
-    s_route_seg_dirty = false;
-    return;
+    s_map_drawn=true;s_route_seg_dirty=false;return;
   }
-  (void)dist_m;
-  if (!s_map_drawn || s_drawn_map_zoom != s_zoom_level ||
-      s_drawn_route_seg.count < 2 || s_route_seg.count < 2) {
-    tft_fill_rect(122, 4, 198, 194, COLOR_NAV_MAP_BG);
-  } else {
-    // Erase only the old road; do not blank the map on each GPS packet.
-    draw_hud_route_lines(&s_drawn_route_seg, true);
-    tft_fill_rect(199, 125, 42, 43, COLOR_NAV_MAP_BG);
-    if (s_drawn_nav_context.poi_type && s_drawn_nav_context.poi_x <= 320 &&
-        s_drawn_nav_context.poi_y <= 240) {
-      tft_fill_circle(route_map_x(s_drawn_nav_context.poi_x),
-                      route_map_y(s_drawn_nav_context.poi_y), 5,
-                      COLOR_NAV_MAP_BG);
-    }
-    tft_fill_rect(124, 4, 136, 26, COLOR_NAV_MAP_BG);
-    tft_fill_rect(124, 171, 190, 24, COLOR_NAV_MAP_BG);
-  }
-
-  if (s_route_seg.count >= 2) {
-    draw_hud_route_lines(&s_route_seg, false);
-  } else {
-    tft_draw_string_centered(220, 75, "WAITING FOR", COLOR_MUTED_TEXT,
-                             COLOR_NAV_MAP_BG, 1);
-    tft_draw_string_centered(220, 89, "ROUTE", COLOR_MUTED_TEXT,
-                             COLOR_NAV_MAP_BG, 1);
-  }
-
-  if (s_nav_context.city[0] && s_nav.gps_available && !s_nav.rerouting) {
-    tft_draw_string_centered(190, 10, s_nav_context.city, COLOR_WHITE,
-                             COLOR_NAV_MAP_BG, 1);
-  }
-  if (s_nav_context.poi_type) {
-    if (s_nav_context.poi_x <= 320 && s_nav_context.poi_y <= 240) {
-      int px = route_map_x(s_nav_context.poi_x);
-      int py = route_map_y(s_nav_context.poi_y);
-      tft_fill_circle(px, py, 4, COLOR_WHITE);
-      tft_fill_circle(px, py, 2, COLOR_NAV_CYAN);
-    }
-    char poi_line[20];
-    snprintf(poi_line, sizeof(poi_line), "%s %um",
-             s_nav_context.poi_type == 1 ? "FUEL" : "REPAIR",
-             (unsigned)s_nav_context.poi_distance_m);
-    tft_fill_rect(124, 171, 190, 24, COLOR_HUD_PANEL);
-    tft_draw_string(128, 173, poi_line, COLOR_NAV_CYAN, COLOR_HUD_PANEL, 1);
-    tft_draw_string(128, 184, s_nav_context.poi_name, COLOR_WHITE,
-                    COLOR_HUD_PANEL, 1);
-  }
-  draw_hud_rider_marker(dir);
+  s_drawn_motion_degrees=(int)lroundf(rider_motion_degrees()/2)*2;
+  // Compose strips before SPI transfer, without clearing the visible map first.
+  paint_route_region(HUD_MAP_X,HUD_MAP_Y,HUD_MAP_W,HUD_MAP_H);
   if (!s_ble_connected || !s_phone_state_ready || !s_nav.gps_available || s_nav.rerouting) {
     const char *warning = !s_ble_connected ? "PHONE OFFLINE" : !s_phone_state_ready ?
         "SYNCING" : s_nav.gps_available ? "REROUTING" : "GPS LOST";
-    tft_fill_rect(132, 7, 92, 18, COLOR_HUD_PANEL);
-    tft_draw_string_centered(190, 12, warning, COLOR_WHITE,
-                             COLOR_HUD_PANEL, 1);
+    hud_text(132,7,warning,10,HUD_MUTED,HUD_BG,150);
   }
-  s_drawn_route_seg = s_route_seg;
-  s_drawn_nav_context = s_nav_context;
-  s_drawn_map_zoom = s_zoom_level;
-  s_map_drawn = true;
-  s_route_seg_dirty = false;
-}
-
-// ── 6. COMPACT SPEED OVERLAY: leave the right side for the live map.
-static void draw_hud_speed_badge(uint16_t speed_kmh) {
-  tft_fill_rect(10, 174, 102, 19, COLOR_HUD_PANEL);
-  char speed[18];
-  if (s_ble_connected && s_phone_state_ready && s_nav.gps_available)
-    snprintf(speed, sizeof(speed), "%u km/h", (unsigned)speed_kmh);
-  else snprintf(speed, sizeof(speed), "-- km/h");
-  tft_draw_string(12, 177, speed, COLOR_WHITE, COLOR_HUD_PANEL, 1);
-  const char *status = !s_ble_connected ? "OFFLINE" : !s_phone_state_ready ? "SYNCING" :
-      !s_nav.gps_available ? "GPS LOST" : s_nav.rerouting ? "REROUTING" : map_frame_active() ? map_frame_status() : "Then";
-  tft_fill_rect(12, 114, 98, 9, COLOR_HUD_PANEL);
-  tft_draw_string(14, 114, status, COLOR_MUTED_TEXT, COLOR_HUD_PANEL, 1);
+  s_map_drawn=true;s_route_seg_dirty=false;
 }
 
 // =============================================================================
@@ -1162,42 +835,16 @@ static void draw_hud_speed_badge(uint16_t speed_kmh) {
 // Displays strictly ONLY the latest incoming notification with auto/tap dismiss
 // =============================================================================
 static void render_notification_banner(void) {
-  if (!s_latest_notif.active)
-    return;
-
-  const int nx = 12;
-  const int ny = 34;
-  const int nw = DISPLAY_WIDTH - 24; // 296 px
-  const int nh = 52;
-
-  // Solid dark card background with bright white automotive border
-  tft_fill_rect(nx, ny, nw, nh, COLOR_BLACK);
-  tft_draw_rect(nx, ny, nw, nh, COLOR_WHITE);
-  tft_draw_rect(nx + 1, ny + 1, nw - 2, nh - 2, COLOR_WHITE);
-
-  // Bell / Alert Icon on the left (at X=28, Y=60)
-  // Small bell outline & clapper
-  tft_fill_triangle(28, 44, 22, 56, 34, 56, COLOR_WHITE);
-  tft_fill_rect(20, 56, 16, 3, COLOR_WHITE);
-  tft_fill_circle(28, 61, 2, COLOR_WHITE);
-
-  // Title (Sender or App) in bold white (Scale 2 or 1)
-  char title_buf[24] = {0};
-  strncpy(title_buf,
-          s_latest_notif.title[0] ? s_latest_notif.title : "Notification",
-          sizeof(title_buf) - 1);
-  tft_draw_string(44, 42, title_buf, COLOR_WHITE, COLOR_BLACK, 1);
-
-  // Dismiss hint 'X' on top right
-  tft_draw_string(nx + nw - 18, 42, "x", COLOR_LIGHTGREY, COLOR_BLACK, 1);
-
-  // Subtitle / Body text (Light grey, Scale 1, truncated)
-  char msg_buf[38] = {0};
-  strncpy(msg_buf,
-          s_latest_notif.message[0] ? s_latest_notif.message
-                                    : "New message received",
-          sizeof(msg_buf) - 1);
-  tft_draw_string(44, 62, msg_buf, COLOR_LIGHTGREY, COLOR_BLACK, 1);
+  if (!s_latest_notif.active || s_current_screen == SCREEN_OTA || s_call.state==1) return;
+  unsigned elapsed=(unsigned)((esp_timer_get_time()-s_notif_started_us)/1000);
+  unsigned remaining=elapsed>=2000?0:2000-elapsed;
+  if (s_notif_dirty) {
+    hud_notification(s_latest_notif.app,s_latest_notif.title,s_latest_notif.message,remaining);
+    s_notif_dirty=false;
+  } else {
+    tft_fill_rect(104,29,127,1,HUD_PANEL);
+    tft_fill_rect(104,29,127*remaining/2000,1,HUD_ACCENT);
+  }
 }
 
 // =============================================================================
@@ -1264,207 +911,58 @@ bool display_is_route_interrupted(void) { return s_nav_interrupted; }
 // are updated via dirty-region partial redraws without screen flicker.
 // =============================================================================
 
-static wrong_turn_state_t s_wrong_turn_state = WRONG_TURN_NONE;
-static uint16_t s_wrong_turn_debounce = 0;
-static bool s_wrong_turn_notified = false;
 
+static hud_model_t s_last_hud;
+#define ARRIVAL_DISPLAY_US (10LL * 1000 * 1000)
+static int64_t s_arrival_started_us;
+static nav_context_t s_pois[2];
+static uint32_t s_last_map_paint,s_last_marker_paint;
 static void display_nav_render_partial(void) {
-  if (s_current_screen != SCREEN_NAV)
-    return;
-
-  // When there is no active ride started, keep the display on SCREEN_HOME
-  if (!s_nav.is_navigating && s_nav.direction != NAV_DIR_REACHED) {
-    s_current_screen = SCREEN_HOME;
-    s_hud.is_frame_active = false;
+  if (s_current_screen != SCREEN_NAV) return;
+  if (s_arrival_started_us && esp_timer_get_time() - s_arrival_started_us >= ARRIVAL_DISPLAY_US) {
+    s_arrival_started_us = 0;
     display_show_home_screen();
     return;
   }
-
-  if (s_latest_notif.active || s_show_route_resume_modal) return;
-
-  // -------------------------------------------------------------------------
-  // 0. ARRIVAL SCREEN (NAV_DIR_REACHED) — Dedicated Arrival State
-  // 🏁 You have arrived - Great Ride!
-  // -------------------------------------------------------------------------
-  if (s_nav.direction == NAV_DIR_REACHED) {
-    if (!s_hud.destination_reached) {
-      s_hud.destination_reached = true;
-      s_hud.is_frame_active = false;
-      tft_fill_screen(COLOR_BLACK);
-
-      // Checkered / Victory green circular badge
-      tft_fill_circle(160, 75, 30, COLOR_HUD_PANEL);
-      tft_draw_circle(160, 75, 30, COLOR_NEON_GREEN);
-      tft_draw_circle(160, 75, 31, COLOR_NEON_GREEN);
-      tft_draw_thick_line(146, 75, 156, 87, 4, COLOR_WHITE);
-      tft_draw_thick_line(156, 87, 176, 63, 4, COLOR_WHITE);
-
-      tft_draw_string_centered(160, 118, "YOU HAVE ARRIVED", COLOR_WHITE,
-                               COLOR_BLACK, 2);
-      tft_draw_string_centered(160, 142, "Great Ride!", COLOR_NEON_GREEN,
-                               COLOR_BLACK, 1);
-
-      // END RIDE button prompt
-      tft_fill_round_rect(80, 178, 160, 36, 6, COLOR_HUD_PANEL);
-      tft_draw_round_rect(80, 178, 160, 36, 6, COLOR_NEON_GREEN);
-      tft_draw_string_centered(160, 188, "END RIDE", COLOR_WHITE,
-                               COLOR_HUD_PANEL, 2);
-    }
-    return;
-  } else {
-    s_hud.destination_reached = false;
+  if (!s_nav.is_navigating && s_nav.direction != NAV_DIR_REACHED) {
+    display_show_home_screen(); return;
   }
-
-  // -------------------------------------------------------------------------
-  // 1. PERSISTENT STATIC FRAME INITIALIZATION (Drawn ONCE on entry)
-  // -------------------------------------------------------------------------
-  if (!s_hud.is_frame_active) {
-    tft_fill_screen(COLOR_BLACK);
-    s_map_drawn = false;
-
-    // 2. Top-left primary turn instruction card or wrong-turn recovery card
-    if (s_wrong_turn_state != WRONG_TURN_NONE) {
-      draw_hud_wrong_turn_card(s_wrong_turn_state);
-      s_hud.last_wrong_turn_state = s_wrong_turn_state;
-    } else {
-      draw_hud_primary_turn_card(s_nav.direction, s_nav.distance_meters,
-                                 s_nav.current_street, s_nav.maneuver_state);
-      s_hud.last_wrong_turn_state = WRONG_TURN_NONE;
-    }
-
-    // 3. Secondary maneuver ("Then ^ 2.4 km Continue Straight")
-    draw_hud_secondary_maneuver(s_nav.next_direction,
-                                s_nav.next_distance_meters, s_nav.next_street);
-
-    // 4. Wide live route map and fixed rider marker
-    draw_hud_road_corridor(NAV_DIR_STRAIGHT, s_nav.distance_meters);
-
-    // 5. Compact speed overlay
-    draw_hud_speed_badge(s_speed_kmh);
-
-    // 6. Full-width bottom information bar (5.8 km • 12 min | ETA 14:17)
-    draw_hud_bottom_info_bar();
-
-    s_hud.is_frame_active = true;
-    s_hud.last_arrow_dir = s_nav.direction;
-    s_hud.last_dist_m = s_nav.distance_meters;
-    s_hud.last_corridor_dist_m = s_nav.distance_meters;
-    s_hud.last_next_dir = s_nav.next_direction;
-    s_hud.last_next_dist_m = s_nav.next_distance_meters;
-    strncpy(s_hud.last_next_street, s_nav.next_street,
-            sizeof(s_hud.last_next_street) - 1);
-    s_hud.last_speed = s_speed_kmh;
-    s_hud.last_gps_available = s_nav.gps_available;
-    s_hud.last_rerouting = s_nav.rerouting;
-    s_hud.last_remaining_dist_km = s_nav.remaining_dist_km;
-    s_hud.last_route_progress_pct = s_route_seg.progress_percent;
-    strncpy(s_hud.last_eta, s_nav.eta_time_str, sizeof(s_hud.last_eta) - 1);
-    strncpy(s_hud.last_street, s_nav.current_street,
-            sizeof(s_hud.last_street) - 1);
+  hud_model_t model = {0};
+  model.speed=s_speed_kmh; model.speed_valid=s_ble_connected && s_phone_state_ready && s_nav.gps_available;
+  model.heading=s_nav.heading_deg; model.direction=s_nav.direction; model.distance_m=s_nav.distance_meters;
+  model.remaining_km=s_nav.remaining_dist_km;
+  snprintf(model.duration,sizeof(model.duration),"%s",s_nav.eta_time_str);
+  const char *instruction=s_nav.current_street;
+  if(s_nav.is_navigating) {
+    if(!s_ble_connected)instruction="PHONE OFFLINE";
+    else if(!s_phone_state_ready)instruction="SYNCING";
+    else if(!s_nav.gps_available)instruction="GPS LOST";
+    else if(s_nav.rerouting)instruction="REROUTING";
   }
-
-  // -------------------------------------------------------------------------
-  // 2. WARNING BANNERS (GPS LOST / REROUTING) — Center Map Canvas (Y: 26..46)
-  // -------------------------------------------------------------------------
-  if (s_nav.gps_available != s_hud.last_gps_available ||
-      s_nav.rerouting != s_hud.last_rerouting) {
-    s_route_seg_dirty = true;
-    s_hud.last_gps_available = s_nav.gps_available;
-    s_hud.last_rerouting = s_nav.rerouting;
+  snprintf(model.instruction,sizeof(model.instruction),"%s",instruction);
+  for(int i=0;i<2;i++){model.poi_valid[i]=s_pois[i].poi_type==i+1 && s_pois[i].poi_name[0];model.poi_distance[i]=s_pois[i].poi_distance_m;}
+  bool first=!s_hud.is_frame_active;
+  if(first){tft_fill_screen(HUD_BG);s_map_drawn=false;s_route_seg_dirty=true;}
+  map_frame_set_tilt(rider_motion_degrees());
+  bool route_painted=s_route_seg_dirty && !map_frame_active();
+  if(s_route_seg_dirty)draw_hud_road_corridor(NAV_DIR_STRAIGHT,s_nav.distance_meters);
+  else {
+    map_frame_draw(false);
+    if(!map_frame_active() && s_drawn_motion_degrees!=(int)lroundf(rider_motion_degrees()/2)*2)
+      draw_hud_rider_marker(NAV_DIR_STRAIGHT);
   }
-
-  // -------------------------------------------------------------------------
-  // 3. DYNAMIC ROAD CORRIDOR & TURN ARROW UPDATE
-  // -------------------------------------------------------------------------
-  // The phone sends heading-up geometry. Tilt is not an absolute GPS bearing.
-  nav_direction_t arrow_dir = NAV_DIR_STRAIGHT;
-
-  bool marker_changed = (arrow_dir != s_last_marker_dir);
-  if (s_route_seg_dirty) {
-    draw_hud_road_corridor(arrow_dir, s_nav.distance_meters);
-    draw_hud_speed_badge(s_speed_kmh);
-    s_hud.last_speed = s_speed_kmh;
-    s_hud.last_corridor_dist_m = s_nav.distance_meters;
-  } else if (marker_changed && !map_frame_active()) {
-    draw_hud_rider_marker(arrow_dir);
-  }
-
-  // -------------------------------------------------------------------------
-  // 4. DYNAMIC PRIMARY TURN CARD & REROUTING WARNING UPDATE
-  // -------------------------------------------------------------------------
-  // Route ownership remains in the APK. Firmware has no GPS route geometry,
-  // so it must not infer off-route state from distance deltas or request a
-  // second reroute engine. The APK's authoritative rerouting flag drives the
-  // HUD warning and is already debounced against GPS noise there.
-  if (s_nav.is_navigating && s_nav.rerouting) {
-    s_wrong_turn_state = WRONG_TURN_REROUTING;
-  } else {
-    s_wrong_turn_state = WRONG_TURN_NONE;
-    s_wrong_turn_debounce = 0;
-    s_wrong_turn_notified = false;
-  }
-
-  bool wrong_turn_changed = (s_wrong_turn_state != s_hud.last_wrong_turn_state);
-  if (s_wrong_turn_state != WRONG_TURN_NONE) {
-    if (wrong_turn_changed || s_nav.distance_meters != s_hud.last_dist_m) {
-      draw_hud_wrong_turn_card(s_wrong_turn_state);
-      s_hud.last_wrong_turn_state = s_wrong_turn_state;
-    }
-  } else {
-    bool street_changed = (strncmp(s_nav.current_street, s_hud.last_street,
-                                   sizeof(s_hud.last_street) - 1) != 0);
-    if (s_nav.distance_meters != s_hud.last_dist_m ||
-        s_nav.direction != s_hud.last_arrow_dir ||
-        street_changed || wrong_turn_changed) {
-      draw_hud_primary_turn_card(s_nav.direction, s_nav.distance_meters,
-                                 s_nav.current_street, s_nav.maneuver_state);
-      s_hud.last_dist_m = s_nav.distance_meters;
-      s_hud.last_arrow_dir = s_nav.direction;
-      s_hud.last_wrong_turn_state = WRONG_TURN_NONE;
-      strncpy(s_hud.last_street, s_nav.current_street,
-              sizeof(s_hud.last_street) - 1);
-    }
-  }
-
-  // Dynamic secondary maneuver update (direction, distance, or instruction
-  // changed)
-  bool next_street_changed = (strncmp(s_nav.next_street, s_hud.last_next_street,
-                                      sizeof(s_hud.last_next_street) - 1) != 0);
-  if (s_nav.next_direction != s_hud.last_next_dir ||
-      s_nav.next_distance_meters != s_hud.last_next_dist_m ||
-      next_street_changed) {
-    draw_hud_secondary_maneuver(s_nav.next_direction,
-                                s_nav.next_distance_meters, s_nav.next_street);
-    s_hud.last_next_dir = s_nav.next_direction;
-    s_hud.last_next_dist_m = s_nav.next_distance_meters;
-    strncpy(s_hud.last_next_street, s_nav.next_street,
-            sizeof(s_hud.last_next_street) - 1);
-  }
-
-  // Dynamic trip summary progress update (remaining distance & duration)
-  if (fabsf(s_nav.remaining_dist_km - s_hud.last_remaining_dist_km) >= 0.05f ||
-      s_route_seg.progress_percent != s_hud.last_route_progress_pct ||
-      strncmp(s_nav.eta_time_str, s_hud.last_eta, sizeof(s_hud.last_eta) - 1) !=
-          0) {
-    draw_hud_bottom_info_bar();
-    s_hud.last_remaining_dist_km = s_nav.remaining_dist_km;
-    s_hud.last_route_progress_pct = s_route_seg.progress_percent;
-    strncpy(s_hud.last_eta, s_nav.eta_time_str, sizeof(s_hud.last_eta) - 1);
-  }
-
-  // -------------------------------------------------------------------------
-  // 5. DYNAMIC SPEEDOMETER GAUGE UPDATE (Showing live s_speed_kmh)
-  // -------------------------------------------------------------------------
-  if (s_speed_kmh != s_hud.last_speed) {
-    draw_hud_speed_badge(s_speed_kmh);
-    s_hud.last_speed = s_speed_kmh;
-  }
-
-  // -------------------------------------------------------------------------
-  // 6. OVERLAYS (Latest Notification & Route Resume Modal if active)
-  // -------------------------------------------------------------------------
-  render_notification_banner();
-  render_route_resume_modal();
+  bool map_changed=first || route_painted || map_frame_paint_serial()!=s_last_map_paint;
+  s_last_map_paint=map_frame_paint_serial();
+  bool marker_changed=map_frame_marker_serial()!=s_last_marker_paint;
+  s_last_marker_paint=map_frame_marker_serial();
+  if(first || model.speed!=s_last_hud.speed || model.speed_valid!=s_last_hud.speed_valid)hud_speed(&model);
+  for(int i=0;i<2;i++)if(first || model.poi_valid[i]!=s_last_hud.poi_valid[i] || model.poi_distance[i]!=s_last_hud.poi_distance[i])hud_poi(&model,i);
+  if(first || map_changed || (marker_changed && map_frame_marker_overlaps(245,4,73,34)) || model.remaining_km!=s_last_hud.remaining_km || strcmp(model.duration,s_last_hud.duration))hud_trip(&model);
+  if(first || model.direction!=s_last_hud.direction || model.distance_m!=s_last_hud.distance_m || strcmp(model.instruction,s_last_hud.instruction))hud_maneuver(&model);
+  if(first || map_changed || (marker_changed && map_frame_marker_overlaps(290,123,26,26)) || model.heading!=s_last_hud.heading)hud_compass(model.heading);
+  if(map_changed || (marker_changed && map_frame_marker_overlaps(100,4,135,27)))s_notif_dirty=true;
+  s_last_hud=model; s_hud.last_dist_m=model.distance_m; s_hud.is_frame_active=true;
+  render_notification_banner(); render_route_resume_modal();
 }
 
 void display_show_main_screen(void) {
@@ -1472,6 +970,7 @@ void display_show_main_screen(void) {
     display_init();
   s_current_screen = SCREEN_NAV;
   s_hud.is_frame_active = false;
+  s_hud.destination_reached = false;
   display_nav_render_partial();
 }
 
@@ -1484,6 +983,7 @@ void display_show_main_screen(void) {
 
 static const esp_partition_t *s_user_img_part = NULL;
 static size_t s_stream_flash_offset = 0;
+static volatile bool s_image_refresh_requested;
 
 static const esp_partition_t *get_user_img_partition(void) {
   if (!s_user_img_part) {
@@ -1503,9 +1003,10 @@ bool display_has_user_image(void) {
   const esp_partition_t *part = get_user_img_partition();
   if (!part)
     return false;
-  uint32_t magic = 0;
-  if (esp_partition_read(part, 0, &magic, sizeof(magic)) == ESP_OK) {
-    if (magic == USER_IMG_MAGIC) {
+  uint32_t header[2] = {0};
+  if (part->size >= 4096u + USER_IMG_TOTAL_BYTES &&
+      esp_partition_read(part, 0, header, sizeof(header)) == ESP_OK) {
+    if (header[0] == USER_IMG_MAGIC && header[1] == USER_IMG_TOTAL_BYTES) {
       s_user_image_valid = true;
       return true;
     }
@@ -1515,17 +1016,25 @@ bool display_has_user_image(void) {
 
 bool display_start_image_stream(void) {
   if (!s_is_initialized) display_init();
+  xSemaphoreTakeRecursive(s_display_mutex,portMAX_DELAY);
   // Flash erase must not interrupt an active ride or OTA rendering.
-  if (s_nav.is_navigating || s_current_screen == SCREEN_OTA) return false;
+  if (s_nav.is_navigating || s_current_screen == SCREEN_OTA) {
+    xSemaphoreGiveRecursive(s_display_mutex);
+    return false;
+  }
   const esp_partition_t *part = get_user_img_partition();
   const size_t image_end = 4096u + USER_IMG_TOTAL_BYTES;
   const size_t erase_size = (image_end + 4095u) & ~(size_t)4095u;
   if (!part || erase_size > part->size ||
-      esp_partition_erase_range(part, 0, erase_size) != ESP_OK) return false;
+      esp_partition_erase_range(part, 0, erase_size) != ESP_OK) {
+    xSemaphoreGiveRecursive(s_display_mutex);
+    return false;
+  }
   s_user_image_valid = false;
-  s_current_screen = SCREEN_PICTURE;
   s_stream_flash_offset = 4096;
-  tft_stream_image_start();
+  s_screen_refresh = true;
+  display_set_screen(SCREEN_PICTURE);
+  xSemaphoreGiveRecursive(s_display_mutex);
   return true;
 }
 
@@ -1535,7 +1044,8 @@ bool display_write_image_chunk(const uint8_t *chunk, size_t len) {
   const esp_partition_t *part = get_user_img_partition();
   if (!part || esp_partition_write(part, s_stream_flash_offset, chunk, len) != ESP_OK) return false;
   s_stream_flash_offset += len;
-  tft_stream_image_chunk(chunk, len);
+  // Store only. Painting these chunks here races swipes and can overwrite
+  // Music/Home/Settings after the user leaves the photo page.
   return true;
 }
 
@@ -1545,8 +1055,7 @@ bool display_finish_image_stream(void) {
   uint32_t header[2] = {USER_IMG_MAGIC, USER_IMG_TOTAL_BYTES};
   if (!part || esp_partition_write(part, 0, header, sizeof(header)) != ESP_OK) return false;
   s_user_image_valid = true;
-  s_current_screen = SCREEN_PICTURE;
-  render_pagination(SCREEN_PICTURE);
+  s_image_refresh_requested = true;
   return true;
 }
 
@@ -1572,9 +1081,13 @@ void display_show_user_image(void) {
       while (remaining > 0) {
         size_t chunk =
             (remaining > sizeof(read_buf)) ? sizeof(read_buf) : remaining;
-        if (esp_partition_read(part, offset, read_buf, chunk) == ESP_OK) {
-          tft_stream_image_chunk(read_buf, chunk);
+        if (esp_partition_read(part, offset, read_buf, chunk) != ESP_OK) {
+          ESP_LOGE(TAG,"Photo read failed at offset %u",(unsigned)offset);
+          tft_fill_screen(COLOR_BLACK);
+          tft_draw_string_centered(160,110,"IMAGE UNAVAILABLE",COLOR_WHITE,COLOR_BLACK,2);
+          break;
         }
+        tft_stream_image_chunk(read_buf, chunk);
         offset += chunk;
         remaining -= chunk;
       }
@@ -1586,6 +1099,13 @@ void display_show_user_image(void) {
     tft_draw_string_centered(160, 140, "Upload an image from the app",
                              COLOR_LIGHTGREY, COLOR_BLACK, 1);
   }
+
+  // Draw page identity and navigation AFTER the full-screen image. Even an
+  // entirely black uploaded photo must not look like an unresponsive display.
+  tft_fill_rect(0,0,DISPLAY_WIDTH,27,COLOR_BLACK);
+  tft_draw_string(12,9,"PHOTO",COLOR_JUST_GREEN,COLOR_BLACK,1);
+  tft_draw_string(176,9,"SWIPE TO CHANGE",COLOR_LIGHTGREY,COLOR_BLACK,1);
+  render_pagination(SCREEN_PICTURE);
 
   // Latest Notification Overlay (if active)
   render_notification_banner();
@@ -1600,6 +1120,33 @@ static void update_brightness_widgets(void) {
   snprintf(bright_val_str, sizeof(bright_val_str), "%d%%", s_brightness_pct);
   tft_fill_rect(240, 80, 50, 18, COLOR_BLACK);
   tft_draw_string(240, 80, bright_val_str, COLOR_WHITE, COLOR_BLACK, 1);
+}
+
+static void render_motion_settings(bool force) {
+  static int last_roll = 10000, last_pitch = 10000, last_motion = -1;
+  static char last_status[32];
+  const char *status = mpu6500_get_status();
+  int roll = (int)mpu6500_get_roll_deg(), pitch = (int)mpu6500_get_pitch_deg();
+  int motion = mpu6500_get_motion();
+  if (!force && roll == last_roll && pitch == last_pitch && motion == last_motion && !strcmp(status,last_status)) return;
+  if (force) {
+    tft_fill_rect(24,35,272,181,COLOR_BLACK);
+    tft_draw_rect(24,35,272,181,COLOR_JUST_GREEN);
+    tft_draw_string_centered(160,47,"ACCELEROMETER",COLOR_WHITE,COLOR_BLACK,2);
+    tft_draw_round_rect(36,158,158,42,5,COLOR_JUST_GREEN);
+    tft_draw_string_centered(115,174,"CALIBRATE",COLOR_WHITE,COLOR_BLACK,1);
+    tft_draw_round_rect(204,158,80,42,5,COLOR_LIGHTGREY);
+    tft_draw_string_centered(244,174,"DONE",COLOR_WHITE,COLOR_BLACK,1);
+  }
+  tft_fill_rect(32,75,256,76,COLOR_BLACK);
+  tft_draw_string_centered(160,78,status,COLOR_JUST_GREEN,COLOR_BLACK,1);
+  char angles[34]; snprintf(angles,sizeof(angles),"Roll %+d  Pitch %+d",roll,pitch);
+  tft_draw_string_centered(160,100,angles,COLOR_WHITE,COLOR_BLACK,1);
+  const char *motions[] = {"LEVEL","FORWARD","BACKWARD","LEFT","RIGHT"};
+  tft_draw_string_centered(160,120,mpu6500_is_calibration_complete() && !strcmp(status,"READY") ? motions[motion >=0 && motion <=4 ? motion:0] : "Keep device still, then calibrate",COLOR_WHITE,COLOR_BLACK,1);
+  tft_draw_string_centered(160,138,"Tilt is not GPS speed or a route turn",COLOR_LIGHTGREY,COLOR_BLACK,1);
+  last_roll=roll; last_pitch=pitch; last_motion=motion;
+  snprintf(last_status,sizeof(last_status),"%s",status);
 }
 
 void display_show_settings_screen(void) {
@@ -1637,8 +1184,8 @@ void display_show_settings_screen(void) {
   // Gear Icon
   tft_draw_circle(28, 130, 6, COLOR_WHITE);
   tft_draw_circle(28, 130, 2, COLOR_BLACK);
-  tft_draw_string(46, 124, "System", COLOR_WHITE, COLOR_BLACK, 1);
-  tft_draw_string(224, 124, "v2.1 OTA", COLOR_LIGHTGREY, COLOR_BLACK, 1);
+  tft_draw_string(46, 124, "Motion / Calibrate", COLOR_WHITE, COLOR_BLACK, 1);
+  tft_draw_string(224, 124, mpu6500_is_calibration_complete() ? "Ready" : "Setup", COLOR_LIGHTGREY, COLOR_BLACK, 1);
   tft_draw_char(292, 124, '>', COLOR_LIGHTGREY, COLOR_BLACK, 1);
 
   // 4. Two Bottom Action Buttons (Y = 154 to 216)
@@ -1726,6 +1273,7 @@ void display_show_settings_screen(void) {
 
   // 5. Pagination Dots
   render_pagination(SCREEN_SETTINGS);
+  if (s_show_motion_settings) render_motion_settings(true);
 
   // 6. Latest Notification Overlay (if active)
   render_notification_banner();
@@ -1882,6 +1430,7 @@ void display_show_ota_screen(uint8_t progress_pct) {
 // SCREEN TRANSITION APIS & SWIPE ROUTING
 // =============================================================================
 void display_set_screen(uint8_t screen_id) {
+  if(s_call.state==1 && screen_id!=SCREEN_OTA)return;
   if (screen_id >= SCREEN_COUNT)
     screen_id = SCREEN_HOME;
   if (screen_id == SCREEN_OTA) {
@@ -1904,6 +1453,10 @@ void display_set_screen(uint8_t screen_id) {
   s_current_screen = (screen_id_t)screen_id;
   s_hud.is_frame_active = false; // Reset HUD static frame flag so entering
                                  // SCREEN_NAV initialises cleanly
+  s_hud.destination_reached = false;
+  s_map_drawn = false;
+  s_show_route_resume_modal = false;
+  s_show_motion_settings = false;
 
   switch (s_current_screen) {
   case SCREEN_HOME:
@@ -1928,6 +1481,7 @@ void display_set_screen(uint8_t screen_id) {
     break;
   }
 
+  ESP_LOGI(TAG,"Screen %d rendered; brightness=%u%%",(int)s_current_screen,(unsigned)s_brightness_pct);
   if (s_display_mutex) {
     xSemaphoreGiveRecursive(s_display_mutex);
   }
@@ -2012,6 +1566,15 @@ static void handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x,
     return;
   }
 
+  if(s_call.state==1) {
+    if(gesture==TOUCH_GESTURE_TAP && s_ble_connected && start_y>=178 && start_y<=221) {
+      uint8_t action=start_x>=18 && start_x<=151?1:start_x>=169 && start_x<=302?2:0;
+      if(action && (s_call.actions & (1<<(action-1)))) {
+        uint8_t packet[2]={0x1C,action};ble_nav_notify_diagnostic_packet(packet,sizeof(packet));
+      }
+    }
+    return;
+  }
   switch (gesture) {
   case TOUCH_GESTURE_SWIPE_LEFT:
     // Dismiss confirmation modal on swipe
@@ -2075,8 +1638,8 @@ static void handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x,
 
     // N: Tap on active Notification Banner (Y: 30..90, X: 10..310) immediately
     // dismisses it
-    if (s_latest_notif.active && ty >= 30 && ty <= 90 && tx >= 10 &&
-        tx <= 310) {
+    if (s_latest_notif.active && ty >= 4 && ty <= 31 && tx >= 100 &&
+        tx <= 235) {
       ESP_LOGI(TAG, "Touch: Notification Banner tapped -> Dismiss");
       display_dismiss_notification();
       return;
@@ -2105,6 +1668,7 @@ static void handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x,
         s_nav_interrupted = false;
         s_nav_was_active = false;
         s_nav.is_navigating = false;
+        mpu6500_end_ride_calibration();
         ble_nav_notify_status(0x06); // NAV_STATUS_CANCEL_ROUTE
         display_set_screen(SCREEN_HOME);
         return;
@@ -2114,7 +1678,17 @@ static void handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x,
     }
 
     if (s_current_screen == SCREEN_MUSIC) {
-      if (!s_ble_connected || s_media.state < 3) return;
+      ESP_LOGI(TAG, "MEDIA TAP x=%d y=%d connected=%d state=%u actions=0x%02x",
+               tx, ty, s_ble_connected, s_media.state, s_media.actions);
+      if (!s_ble_connected) return;
+      if (s_media.state < 3 || s_media.state > 5) {
+        int64_t now = esp_timer_get_time();
+        if (ty >= 118 && ty <= 178 && now - s_last_media_command_us >= 1000000) {
+          s_last_media_command_us = now;
+          ble_media_command(s_media.state == 1 ? 8 : 7);
+        }
+        return;
+      }
       uint8_t command = 0, action = 0;
       if (ty >= 118 && ty <= 178) {
         if (tx >= 10 && tx <= 104) { command = 4; action = 8; }
@@ -2126,6 +1700,8 @@ static void handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x,
         if (tx >= 10 && tx <= 104) { command = 6; action = 16; }
         else if (tx >= 216 && tx <= 310) { command = 5; action = 16; }
       }
+      if (!command) ESP_LOGW(TAG, "MEDIA TAP outside button bounds; check touch calibration");
+      else if (!(s_media.actions & action)) ESP_LOGW(TAG, "MEDIA command %u unavailable in phone session", command);
       int64_t now = esp_timer_get_time();
       if (command && (s_media.actions & action) && now - s_last_media_command_us >= 250000) {
         s_last_media_command_us = now;
@@ -2134,22 +1710,12 @@ static void handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x,
       return;
     }
 
-    // 0. Check NAVIGATION screen touch buttons
-    if (s_current_screen == SCREEN_NAV) {
-      // A: Recenter button / Road pill tap (X: 130..248, Y: 204..238) or legacy
-      // (X: 8..50, Y: 135..175)
-      if ((tx >= 130 && tx <= 248 && ty >= 204 && ty <= 238) ||
-          (tx >= 8 && tx <= 50 && ty >= 135 && ty <= 175)) {
-        ESP_LOGI(TAG, "Touch: NAV RECENTER");
-        display_nav_recenter();
-        return;
-      }
-      // B: Bottom summary card tap -> Return to HOME
-      if (ty >= 204 && ty <= 240 && tx <= 126) {
-        ESP_LOGI(TAG, "Touch: Nav bottom bar tapped -> HOME");
-        display_set_screen(SCREEN_HOME);
-        return;
-      }
+    // Compass returns the actual map camera to the rider; trip card fits route.
+    if(s_current_screen==SCREEN_NAV) {
+      if(tx>=288 && ty>=142 && ty<=171){display_nav_recenter();return;}
+      if(tx>=245 && ty<=38){s_camera_mode=NAV_CAMERA_OVERVIEW;s_zoom_level=NAV_ZOOM_LEVEL_5;
+        uint8_t packet[2]={0x14,255};ble_nav_notify_diagnostic_packet(packet,sizeof(packet));return;}
+      return;
     }
 
     // 1. Check SCREEN_BRIGHTNESS touch controls (Slider, [-], [+], [DONE])
@@ -2217,6 +1783,16 @@ static void handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x,
 
     // 3. Check SETTINGS screen controls
     if (s_current_screen == SCREEN_SETTINGS) {
+      if (s_show_motion_settings) {
+        if (ty >= 158 && ty <= 200 && tx >=36 && tx <=194) {
+          mpu6500_request_calibration();
+          render_motion_settings(true);
+        } else if ((ty >=158 && ty <=200 && tx >=204 && tx <=284) || ty <35 || ty >216) {
+          s_show_motion_settings=false;
+          display_show_settings_screen();
+        }
+        return;
+      }
       // If Brightness Popup Modal is open, handle [-], [+], slider, and [DONE]
       if (s_show_brightness_popup) {
         // [ - ] Button: X: 35..105, Y: 105..160 (Generous 70x55 hitbox)
@@ -2295,6 +1871,11 @@ static void handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x,
         return;
       }
 
+      if (ty >=112 && ty <=148) {
+        s_show_motion_settings=true;
+        render_motion_settings(true);
+        return;
+      }
       // Display / Brightness row (Y: 65..115): opens dedicated Brightness Popup
       // Modal!
       if (ty >= 65 && ty <= 115) {
@@ -2362,31 +1943,6 @@ void display_set_brightness(uint8_t brightness_pct) {
 
 uint8_t display_get_brightness(void) { return s_brightness_pct; }
 
-static bool s_display_power_on = true;
-static uint8_t s_saved_power_brightness = 85;
-
-void display_set_power(bool on) {
-  s_display_power_on = on;
-  if (!on) {
-    if (s_brightness_pct > 0) {
-      s_saved_power_brightness = s_brightness_pct;
-    }
-    tft_set_backlight(0);
-    ESP_LOGI(TAG, "Display power OFF (Backlight 0%%)");
-  } else {
-    uint8_t restore_b =
-        (s_saved_power_brightness > 0) ? s_saved_power_brightness : 85;
-    s_brightness_pct = restore_b;
-    tft_set_backlight(restore_b);
-    ESP_LOGI(TAG, "Display power ON (Backlight restored to %d%%)", restore_b);
-    if (s_is_initialized) {
-      display_set_screen(s_current_screen);
-    }
-  }
-}
-
-bool display_get_power(void) { return s_display_power_on; }
-
 static TaskHandle_t s_nav_render_task_handle = NULL;
 
 static void nav_render_task(void *pvParam) {
@@ -2397,7 +1953,7 @@ static void nav_render_task(void *pvParam) {
   while (1) {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
 
-    if (!s_is_initialized || !s_display_power_on) {
+    if (!s_is_initialized) {
       continue;
     }
 
@@ -2408,48 +1964,73 @@ static void nav_render_task(void *pvParam) {
         display_dismiss_notification();
       }
       int64_t started = esp_timer_get_time();
+      if (s_image_refresh_requested && s_call.state!=1) {
+        s_image_refresh_requested = false;
+        if (s_current_screen == SCREEN_PICTURE) display_show_user_image();
+      }
       bool connected;
       if (xQueueReceive(s_connection_queue, &connected, 0) == pdTRUE) {
         s_ble_connected = connected;
+        s_call_painted=false;
         s_phone_state_ready = false;
+        s_media = (media_state_t){.state = 6};
         s_media_dirty = true;
         s_route_seg_dirty = true;
         s_nav_interrupted = !connected && s_nav.is_navigating;
       }
       notification_info_t notification;
       if (xQueueReceive(s_notification_queue, &notification, 0) == pdTRUE)
-        apply_notification(notification.title, notification.message);
+        apply_notification(&notification);
       navigation_data_t nav;
       if (xQueueReceive(s_nav_queue, &nav, 0) == pdTRUE) apply_navigation(&nav);
       route_segment_t segment;
       if (xQueueReceive(s_route_queue, &segment, 0) == pdTRUE && s_nav.is_navigating &&
           memcmp(&segment, &s_route_seg, sizeof(segment)) != 0) {
+        bool geometry_changed=segment.count!=s_route_seg.count ||
+          segment.completed_segment_count!=s_route_seg.completed_segment_count ||
+          segment.is_destination_visible!=s_route_seg.is_destination_visible ||
+          segment.dest_x!=s_route_seg.dest_x || segment.dest_y!=s_route_seg.dest_y ||
+          memcmp(segment.points,s_route_seg.points,sizeof(segment.points))!=0;
         s_route_seg = segment;
-        s_route_seg_dirty = true;
+        if(geometry_changed)s_route_seg_dirty = true;
       }
       nav_context_t context;
-      if (xQueueReceive(s_context_queue, &context, 0) == pdTRUE && s_nav.is_navigating &&
-          memcmp(&context, &s_nav_context, sizeof(context)) != 0) {
-        s_nav_context = context;
-        s_route_seg_dirty = true;
+      while (xQueueReceive(s_context_queue,&context,0)==pdTRUE) {
+        s_nav_context=context;
+        if(context.poi_type>=1 && context.poi_type<=2)s_pois[context.poi_type-1]=context;
+        else memset(s_pois,0,sizeof(s_pois));
       }
       media_state_t media;
       if (xQueueReceive(s_media_queue, &media, 0) == pdTRUE && memcmp(&media, &s_media, sizeof(media)) != 0) {
         s_media = media;
         s_media_dirty = true;
       }
+      call_info_t call;
+      bool restore_call=false;
+      if(xQueueReceive(s_call_queue,&call,0)==pdTRUE) {
+        restore_call=s_call.state==1 && call.state!=1;
+        if(memcmp(&s_call,&call,sizeof(call)))s_call_painted=false;
+        s_call=call;
+      }
+      if(s_call.state==1 && s_current_screen!=SCREEN_OTA) {
+        if(!s_call_painted){hud_call(s_call.caller,s_call.actions,s_ble_connected);s_call_painted=true;}
+      } else {
+      if(restore_call && s_current_screen!=SCREEN_OTA){s_screen_refresh=true;display_set_screen(s_current_screen);}
       if (s_current_screen == SCREEN_NAV) display_nav_render_partial();
       else if (s_current_screen == SCREEN_MUSIC && !s_latest_notif.active) render_music();
+      else if (s_current_screen == SCREEN_SETTINGS && s_show_motion_settings) render_motion_settings(false);
+      }
       int64_t elapsed = esp_timer_get_time() - started;
-      static int64_t last_metrics, max_render_us;
+      static int64_t last_metrics, max_render_us,total_render_us;
+      static uint32_t render_ticks;
+      total_render_us+=elapsed;render_ticks++;
       if (elapsed > max_render_us) max_render_us = elapsed;
       if (esp_timer_get_time() - last_metrics >= 30000000) {
-        last_metrics = esp_timer_get_time();
-        ESP_LOGI(TAG, "metrics: max_render_us=%lld heap=%u largest=%u stack_free=%u", max_render_us,
+        ESP_LOGI(TAG, "metrics: max_render_us=%lld avg_render_us=%lld ticks=%lu window_ms=%lld notifications=%d heap=%u largest=%u stack_free=%u", max_render_us,total_render_us/render_ticks,(unsigned long)render_ticks,(esp_timer_get_time()-last_metrics)/1000,s_latest_notif.active,
           (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
           (unsigned)uxTaskGetStackHighWaterMark(NULL));
-        max_render_us = 0;
+        max_render_us = 0;total_render_us=0;render_ticks=0;last_metrics=esp_timer_get_time();
       }
       xSemaphoreGiveRecursive(s_display_mutex);
     }
@@ -2464,14 +2045,15 @@ void display_init(void) {
     s_display_mutex = xSemaphoreCreateRecursiveMutex();
   }
 
+  s_call_queue=xQueueCreateStatic(1,sizeof(call_info_t),s_call_queue_bytes,&s_call_queue_storage);
   s_nav_queue = xQueueCreateStatic(1, sizeof(navigation_data_t), s_nav_queue_bytes, &s_nav_queue_storage);
   s_media_queue = xQueueCreateStatic(1, sizeof(media_state_t), s_media_queue_bytes, &s_media_queue_storage);
   s_route_queue = xQueueCreateStatic(1, sizeof(route_segment_t), s_route_queue_bytes, &s_route_queue_storage);
-  s_context_queue = xQueueCreateStatic(1, sizeof(nav_context_t), s_context_queue_bytes, &s_context_queue_storage);
+  s_context_queue = xQueueCreateStatic(4, sizeof(nav_context_t), s_context_queue_bytes, &s_context_queue_storage);
   s_connection_queue = xQueueCreateStatic(1, sizeof(bool), s_connection_queue_bytes, &s_connection_queue_storage);
   s_notification_queue = xQueueCreateStatic(1, sizeof(notification_info_t), s_notification_queue_bytes, &s_notification_queue_storage);
   configASSERT(s_display_mutex && s_nav_queue && s_media_queue && s_route_queue &&
-      s_context_queue && s_connection_queue && s_notification_queue);
+      s_context_queue && s_connection_queue && s_notification_queue && s_call_queue);
   ESP_ERROR_CHECK(tft_init());
   ESP_ERROR_CHECK(touch_init());
 
@@ -2491,10 +2073,10 @@ void display_set_time(uint8_t hours, uint8_t minutes) {
     minutes = 59;
   s_time_hours = hours;
   s_time_minutes = minutes;
-  if (s_is_initialized && s_current_screen == SCREEN_HOME) {
+  if (s_is_initialized && s_current_screen == SCREEN_HOME && s_call.state!=1) {
     if (s_display_mutex &&
         xSemaphoreTakeRecursive(s_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-      draw_home_screen_clock();
+      if(s_call.state!=1)draw_home_screen_clock();
       xSemaphoreGiveRecursive(s_display_mutex);
     }
   }
@@ -2584,7 +2166,17 @@ static void apply_navigation(const navigation_data_t *nav_data) {
     }
   }
 
+  bool arriving = filtered.direction == NAV_DIR_REACHED && s_nav.direction != NAV_DIR_REACHED;
+  if (arriving) {
+    s_arrival_started_us = esp_timer_get_time();
+    tft_set_backlight(s_brightness_pct);
+  }
+  if (filtered.is_navigating) s_arrival_started_us = 0;
   bool entering = !s_nav.is_navigating && filtered.is_navigating;
+  if (entering) mpu6500_begin_ride_calibration();
+  if (!filtered.is_navigating && s_nav.is_navigating) {
+    mpu6500_end_ride_calibration();
+  }
   bool critical_turn = filtered.is_navigating && filtered.gps_available &&
       filtered.maneuver_state == 4 && s_nav.maneuver_state != 4 && s_current_screen == SCREEN_MUSIC;
   {
@@ -2597,6 +2189,7 @@ static void apply_navigation(const navigation_data_t *nav_data) {
         (!s_nav.is_navigating && filtered.is_navigating)) {
       memset(&s_route_seg, 0, sizeof(s_route_seg));
       memset(&s_nav_context, 0, sizeof(s_nav_context));
+      memset(s_pois,0,sizeof(s_pois));
       s_route_seg_dirty = true;
       if (!s_nav.is_navigating && filtered.is_navigating) {
         s_camera_mode = NAV_CAMERA_FOLLOW;
@@ -2608,7 +2201,7 @@ static void apply_navigation(const navigation_data_t *nav_data) {
     memcpy(&s_nav, &filtered, sizeof(navigation_data_t));
     s_speed_kmh = filtered.speed_kmh;
   }
-  if ((entering || critical_turn) && s_current_screen != SCREEN_OTA) {
+  if ((entering || critical_turn || arriving) && s_current_screen != SCREEN_OTA) {
     s_current_screen = SCREEN_NAV;
     s_hud.is_frame_active = false;
   }
@@ -2631,13 +2224,15 @@ void display_update_route_segment(const route_segment_t *seg) {
 }
 
 void display_update_nav_context(const nav_context_t *context) {
-  if (context && s_context_queue) xQueueOverwrite(s_context_queue, context);
+  if (context && s_context_queue) {
+    if(xQueueSend(s_context_queue,context,0)!=pdTRUE){nav_context_t old;xQueueReceive(s_context_queue,&old,0);xQueueSend(s_context_queue,context,0);}
+  }
 }
 
 bool display_map_packet(const uint8_t *packet, size_t len) {
   if (!s_display_mutex || xSemaphoreTakeRecursive(s_display_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return false;
   bool ok = map_frame_packet(packet, len);
-  if (ok) s_route_seg_dirty = true;
+  if (ok && packet[0]==0x16) s_route_seg_dirty = true;
   xSemaphoreGiveRecursive(s_display_mutex);
   return ok;
 }
@@ -2645,6 +2240,7 @@ bool display_map_packet(const uint8_t *packet, size_t len) {
 void display_begin_route_revision(void) {
   if (s_display_mutex) xSemaphoreTakeRecursive(s_display_mutex, portMAX_DELAY);
   map_frame_invalidate();
+  memset(s_pois,0,sizeof(s_pois));
   if (s_display_mutex) xSemaphoreGiveRecursive(s_display_mutex);
   if (s_route_queue) xQueueReset(s_route_queue);
   if (s_context_queue) xQueueReset(s_context_queue);
@@ -2761,42 +2357,26 @@ static void notif_auto_dismiss_timer_cb(TimerHandle_t xTimer) {
 }
 
 void display_show_notification(const char *title, const char *message) {
+  display_show_app_notification("Alert",title,message);
+}
+
+void display_show_app_notification(const char *app,const char *title,const char *message) {
   if (!s_notification_queue) return;
   notification_info_t notification = {0};
+  snprintf(notification.app,sizeof(notification.app),"%s",app?app:"");
   snprintf(notification.title, sizeof(notification.title), "%s", title ? title : "");
   snprintf(notification.message, sizeof(notification.message), "%s", message ? message : "");
   xQueueOverwrite(s_notification_queue, &notification);
 }
 
-static void apply_notification(const char *title, const char *message) {
-  if (!s_is_initialized)
-    return;
-
-  if (s_display_mutex &&
-      xSemaphoreTakeRecursive(s_display_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-    // Strictly replace previous notification with the latest one
-    memset(&s_latest_notif, 0, sizeof(s_latest_notif));
-    if (title && title[0]) {
-      strncpy(s_latest_notif.title, title, sizeof(s_latest_notif.title) - 1);
-    } else {
-      strncpy(s_latest_notif.title, "Notification",
-              sizeof(s_latest_notif.title) - 1);
-    }
-
-    if (message && message[0]) {
-      strncpy(s_latest_notif.message, message,
-              sizeof(s_latest_notif.message) - 1);
-    } else {
-      strncpy(s_latest_notif.message, "New alert",
-              sizeof(s_latest_notif.message) - 1);
-    }
-    s_latest_notif.active = true;
-
-    // Render banner directly over current screen
-    render_notification_banner();
-
-    xSemaphoreGiveRecursive(s_display_mutex);
-  }
+static void apply_notification(const notification_info_t *notification) {
+  if (!s_is_initialized) return;
+  s_latest_notif=*notification;
+  s_latest_notif.active=true;
+  s_notif_dirty=true;
+  s_notif_started_us=esp_timer_get_time();
+  s_notif_dismiss_requested=false;
+  render_notification_banner();
 
   // Start or reset 2-second auto-dismiss timer
   if (!s_notif_timer) {
@@ -2822,13 +2402,15 @@ void display_dismiss_notification(void) {
     s_latest_notif.active = false;
     memset(&s_latest_notif, 0, sizeof(s_latest_notif));
 
-    // Redraw current screen to cleanly clear the notification banner overlay
+    if(s_call.state==1){xSemaphoreGiveRecursive(s_display_mutex);return;}
+    // Restore only the covered region during navigation.
     switch (s_current_screen) {
     case SCREEN_HOME:
       display_show_home_screen();
       break;
     case SCREEN_NAV:
-      display_show_main_screen();
+      if(map_frame_active()) map_frame_restore_region(100,4,135,27);
+      else s_route_seg_dirty=true;
       break;
     case SCREEN_MUSIC:
       s_media_frame = false;

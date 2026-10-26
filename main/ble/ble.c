@@ -27,6 +27,7 @@
 #include "rtc_time.h"
 #include "ota.h"
 #include "display.h"
+#include "mpu6500.h"
 
 static const char *TAG = "BLE";
 
@@ -198,9 +199,9 @@ static int ble_time_chr_access(uint16_t conn_handle, uint16_t attr_handle,
             uint8_t h_bin = buf[4];
             uint8_t m_bin = buf[5];
             uint8_t s_bin = buf[6];
-            if (h_bin < 24 && m_bin < 60 && s_bin < 60) {
+            uint16_t year = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+            if (time_set_datetime(year, buf[2], buf[3], h_bin, m_bin, s_bin)) {
                 ESP_LOGI(TAG, "RTC synchronized from CTS binary: %02d:%02d:%02d", h_bin, m_bin, s_bin);
-                time_set_current_time(h_bin, m_bin, s_bin);
                 return 0;
             }
         }
@@ -432,7 +433,7 @@ static int ble_img_control_access(uint16_t conn_handle, uint16_t attr_handle,
             ble_img_notify_status(IMG_STATUS_ERROR_ABORTED, 0);
             return BLE_ATT_ERR_UNLIKELY;
         }
-        ESP_LOGI(TAG, "IMG: START — direct TFT stream expecting %" PRIu32 " bytes", image_size);
+        ESP_LOGI(TAG, "IMG: START — storing image, expecting %" PRIu32 " bytes", image_size);
         ble_img_notify_status(IMG_STATUS_READY, 0);
         return 0;
     }
@@ -457,14 +458,14 @@ static int ble_img_control_access(uint16_t conn_handle, uint16_t attr_handle,
         s_img_transfer_active = false;
         s_img_bytes_received  = 0;
         ESP_LOGW(TAG, "IMG: ABORT");
-        display_show_main_screen();
+        display_set_screen(SCREEN_NAV);
         ble_img_notify_status(IMG_STATUS_ERROR_ABORTED, 0);
         return 0;
     case IMG_CMD_RESET:
         s_img_transfer_active = false;
         s_img_bytes_received  = 0;
         ESP_LOGI(TAG, "IMG: RESET — clearing custom image and resetting to default");
-        display_show_main_screen();
+        display_set_screen(SCREEN_NAV);
         ble_img_notify_status(IMG_STATUS_READY, 0);
         return 0;
     default:
@@ -582,12 +583,27 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
         memmove(rx_buf, rx_buf + 5, len - 5);
         len -= 5;
     }
-    if (rx_buf[0] >= 0x14 && rx_buf[0] <= 0x19) {
+    if(rx_buf[0]==0x1C) {
+        if(len<4 || rx_buf[1]>2 || rx_buf[2]>3 || rx_buf[3]>47 || len!=(size_t)(4+rx_buf[3]))
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        char caller[48]={0};memcpy(caller,rx_buf+4,rx_buf[3]);
+        display_update_call(rx_buf[1],rx_buf[2],caller);return 0;
+    }
+    if (rx_buf[0] == 0x1A) {
+        if (len != 2 || rx_buf[1] > 1) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        if (rx_buf[1] == 1 && !mpu6500_request_calibration()) {
+            mpu6500_publish_status();
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+        mpu6500_publish_status();
+        return 0;
+    }
+    if ((rx_buf[0] >= 0x14 && rx_buf[0] <= 0x19)) {
         if (s_img_transfer_active || (ota_get_status() == OTA_STATUS_READY || ota_get_status() == OTA_STATUS_RECEIVING)) return BLE_ATT_ERR_UNLIKELY;
         return display_map_packet(rx_buf, len) ? 0 : BLE_ATT_ERR_UNLIKELY;
     }
     if (rx_buf[0] == 0x12) {
-        if (len < 6 || rx_buf[1] > 5 || rx_buf[2] > 31 || rx_buf[3] > 100)
+        if (len < 6 || rx_buf[1] > 7 || rx_buf[2] > 31 || rx_buf[3] > 100)
             return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
         size_t title_len = rx_buf[4];
         if (title_len > 40 || len < 6 + title_len) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
@@ -749,30 +765,17 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
             display_update_navigation(&stop_data);
             return 0;
         } else if (op == NAV_OP_NOTIFICATION && len >= 3) {
-            // Latest Notification Packet: [0x0F, title_len, title..., msg_len, msg...]
-            uint8_t t_len = rx_buf[1];
-            char title_str[32] = {0};
-            char msg_str[64] = {0};
-            size_t curr = 2;
-
-            if (t_len > 0 && len >= (size_t)(curr + t_len)) {
-                size_t c_len = (t_len < 31) ? t_len : 31;
-                memcpy(title_str, &rx_buf[curr], c_len);
-                title_str[c_len] = '\0';
-                curr += t_len;
-            }
-
-            if (len > curr) {
-                uint8_t m_len = rx_buf[curr++];
-                if (m_len > 0 && len >= (size_t)(curr + m_len)) {
-                    size_t c_len = (m_len < 63) ? m_len : 63;
-                    memcpy(msg_str, &rx_buf[curr], c_len);
-                    msg_str[c_len] = '\0';
-                }
-            }
-
-            ESP_LOGI(TAG, "BLE Notification: Title='%s' Msg='%s'", title_str, msg_str);
-            display_show_notification(title_str, msg_str);
+            // Legacy title/message followed by optional v3 app-label metadata.
+            size_t at=2;uint8_t tl=rx_buf[1];
+            if(tl>31 || at+tl>=len)return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+            char title[32]={0},message[64]={0},app[24]="Alert";
+            memcpy(title,rx_buf+at,tl);at+=tl;
+            uint8_t ml=rx_buf[at++];
+            if(ml>63 || at+ml>len)return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+            memcpy(message,rx_buf+at,ml);at+=ml;
+            if(at<len){uint8_t al=rx_buf[at++];if(al>23 || at+al!=len)return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+              memset(app,0,sizeof(app));memcpy(app,rx_buf+at,al);}
+            display_show_app_notification(app,title,message);
             return 0;
         } else if (op == NAV_OP_DIAGNOSTICS) {
             ESP_LOGI(TAG, "BLE Remote: Diagnostics self-test requested from App");
@@ -962,7 +965,7 @@ static int ble_nav_status_access(uint16_t conn_handle, uint16_t attr_handle,
                                  struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
-        uint8_t status_buf[2] = { 0x01, 0x02 }; // Navigation protocol + RAM map frames
+        uint8_t status_buf[3] = { 0x01, 0x03, 0x03 }; // Sensor and raster HUD
         os_mbuf_append(ctxt->om, status_buf, sizeof(status_buf));
         return 0;
     }
@@ -971,7 +974,8 @@ static int ble_nav_status_access(uint16_t conn_handle, uint16_t attr_handle,
 
 void ble_media_command(uint8_t command)
 {
-    if (command < 1 || command > 7) return;
+    if (command < 1 || command > 8) return;
+    ESP_LOGI(TAG, "MEDIA command -> phone: %u", command);
     uint8_t packet[2] = {0x12, command};
     ble_nav_notify_diagnostic_packet(packet, sizeof(packet));
 }
@@ -1213,6 +1217,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
         break;
 
     case BLE_GAP_EVENT_DISCONNECT:
+        time_save_checkpoint();
         if (s_img_transfer_active) s_img_status = IMG_STATUS_ERROR_ABORTED;
         s_img_transfer_active = false;
         s_revision_received = false;

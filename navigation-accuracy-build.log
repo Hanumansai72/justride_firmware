@@ -1,0 +1,72 @@
+Activating ESP-IDF 5.5
+Setting IDF_PATH to 'C:\Espressif\frameworks\esp-idf-v5.5.5'.
+* Checking python version ... 3.11.2
+* Checking python dependencies ... OK
+* Deactivating the current ESP-IDF environment (if any) ... OK
+* Establishing a new ESP-IDF environment ... OK
+* Identifying shell ... cmd.exe
+* Detecting outdated tools in system ... Found tools that are not used by active ESP-IDF version.
+For removing old versions of idf-driver, idf-python-wheels use command 'python.exe C:\Espressif\frameworks\esp-idf-v5.5.5\tools\idf_tools.py uninstall'
+To free up even more space, remove installation packages of those tools.
+Use option python.exe C:\Espressif\frameworks\esp-idf-v5.5.5\tools\idf_tools.py uninstall --remove-archives.
+
+Done! You can now compile ESP-IDF projects.
+Go to the project directory and run:
+
+  idf.py build
+
+Executing action: all (aliases: build)
+Running ninja in directory C:\Hanumansai_Projects\Justride\justride_firmware\build
+Executing "ninja all"...
+[1/9] Performing build step for 'bootloader'
+
+[1/1] C:\Windows\system32\cmd.exe /C "cd /D C:\Hanumansai_Projects\Justride\justride_firmware\build\bootloader\esp-idf\esptool_py && C:\Espressif\python_env\idf5.5_py3.11_env\Scripts\python.exe C:/Espressif/frameworks/esp-idf-v5.5.5/components/partition_table/check_sizes.py --offset 0x8000 bootloader 0x1000 C:/Hanumansai_Projects/Justride/justride_firmware/build/bootloader/bootloader.bin"
+
+
+Bootloader binary size 0x6660 bytes. 0x9a0 bytes (9%) free.
+
+
+
+[2/9] No install step for 'bootloader'
+
+[3/9] Completed 'bootloader'
+
+[4/9] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/display/display.c.obj
+
+[5/9] Linking C static library esp-idf\main\libmain.a
+
+[6/9] Generating esp-idf/esp_system/ld/sections.ld
+
+[7/9] Linking CXX executable justride_firmware.elf
+
+[8/9] Generating binary image from built executable
+
+esptool.py v4.12.0
+
+
+Creating esp32 image...
+
+
+Merged 2 ELF sections
+
+
+Successfully created esp32 image.
+
+
+Generated C:/Hanumansai_Projects/Justride/justride_firmware/build/justride_firmware.bin
+
+[9/9] C:\Windows\system32\cmd.exe /C "cd /D C:\Hanumansai_Projects\Justride\justride_firmware\build\esp-idf\esptool_py && C:\Espressif\python_env\idf5.5_py3.11_env\Scripts\python.exe C:/Espressif/frameworks/esp-idf-v5.5.5/components/partition_table/check_sizes.py --offset 0x8000 partition --type app C:/Hanumansai_Projects/Justride/justride_firmware/build/partition_table/partition-table.bin C:/Hanumansai_Projects/Justride/justride_firmware/build/justride_firmware.bin"
+
+justride_firmware.bin binary size 0xb05a0 bytes. Smallest app partition is 0x1b0000 bytes. 0xffa60 bytes (59%) free.
+
+
+
+
+Project build complete. To flash, run:
+ idf.py flash
+or
+ idf.py -p PORT flash
+or
+ python -m esptool --chip esp32 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_size 4MB --flash_freq 40m 0x1000 build\bootloader\bootloader.bin 0x8000 build\partition_table\partition-table.bin 0xd000 build\ota_data_initial.bin 0x10000 build\justride_firmware.bin
+or from the "C:\Hanumansai_Projects\Justride\justride_firmware\build" directory
+ python -m esptool --chip esp32 -b 460800 --before default_reset --after hard_reset write_flash "@flash_args"

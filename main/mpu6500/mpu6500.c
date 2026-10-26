@@ -18,6 +18,7 @@
  */
 
 #include "mpu6500.h"
+#include "ble.h"
 #include "display.h"   // display_set_imu_override_direction(), display_set_imu_heading()
 
 #include "driver/i2c.h"
@@ -27,6 +28,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <math.h>
+#include <stdlib.h>
 #include <inttypes.h>
 #include <stdint.h>
 #include <string.h>
@@ -40,7 +42,7 @@ static const char *TAG = "MPU6500";
 #define ACCEL_SENSITIVITY_LSB_G 16384.0f    // LSB per 1g at +/-2g range
 
 #define IMU_TASK_PERIOD_MS      20          // 50 Hz sampling (20ms period)
-#define ACCEL_FILTER_TAU_SEC    0.060f      // Preserves the existing ~0.25 EMA at 50 Hz
+#define ACCEL_FILTER_TAU_SEC    0.020f      // Short noise filter for live local tilt
 #define MOTION_ENTER_DEG        10.0f
 #define MOTION_EXIT_DEG         8.0f
 #define MOTION_DOMINANCE_MARGIN_DEG 2.0f
@@ -67,7 +69,47 @@ static float s_base_ay           = 0.0f;
 static float s_base_az           = 0.0f;
 static bool  s_is_vertical_mount = true;
 static uint8_t s_mpu_addr        = MPU6500_I2C_ADDR;
-static bool s_calibration_complete = false;
+static volatile bool s_calibration_complete = false;
+static volatile bool s_sensor_available, s_calibration_requested, s_calibrating, s_read_error;
+static TaskHandle_t s_imu_task;
+static volatile bool s_auto_calibration;
+static int64_t s_next_auto_calibration_us;
+
+void mpu6500_begin_ride_calibration(void) {
+    if (!s_sensor_available) return;
+    s_auto_calibration = true;
+    s_calibration_requested = true;
+}
+void mpu6500_end_ride_calibration(void) {
+    s_auto_calibration = false;
+    s_calibration_requested = false;
+    s_calibrating = false;
+}
+void mpu6500_publish_status(void) {
+    if (!ble_is_connected()) return;
+    uint8_t state = !s_sensor_available ? 0 : (s_calibrating || s_calibration_requested) ? 2 :
+        s_read_error ? 4 : s_auto_calibration ? 5 : s_calibration_complete ? 3 : 1;
+    int16_t roll = (int16_t)lroundf(s_filtered_roll * 10), pitch = (int16_t)lroundf(s_filtered_pitch * 10);
+    uint8_t packet[8] = {0x1A,1,state,(uint8_t)s_current_motion,
+        (uint8_t)roll,(uint8_t)((uint16_t)roll >> 8),(uint8_t)pitch,(uint8_t)((uint16_t)pitch >> 8)};
+    ble_nav_notify_diagnostic_packet(packet,sizeof(packet));
+}
+static int64_t s_last_sample_us;
+
+bool mpu6500_is_available(void) { return s_sensor_available; }
+const char *mpu6500_get_status(void) {
+    if (!s_sensor_available) return "SENSOR NOT DETECTED";
+    if (s_calibrating || s_calibration_requested) return "KEEP STILL...";
+    if (s_read_error) return "SENSOR READ ERROR";
+    if (s_auto_calibration) return "WAITING FOR STILLNESS";
+    if (!s_calibration_complete) return s_auto_calibration ? "WAITING FOR STILLNESS" : "CALIBRATION NEEDED";
+    return "READY";
+}
+bool mpu6500_request_calibration(void) {
+    if (!s_sensor_available || !s_imu_task || s_calibrating || s_calibration_requested) return false;
+    s_calibration_requested = true;
+    return true;
+}
 
 #if MPU6500_DIAGNOSTIC_MODE
 typedef struct {
@@ -220,24 +262,7 @@ float mpu6500_get_heading_deg(void) {
 }
 
 void mpu6500_reset_heading(void) {
-    if (s_gyro_available) {
-        s_heading_deg = 0.0f;
-    } else {
-        int16_t ax = 0, ay = 0, az = 0;
-        if (mpu6500_read_accel(&ax, &ay, &az) == ESP_OK) {
-            s_base_ax = (float)ax;
-            s_base_ay = (float)ay;
-            s_base_az = (float)az;
-            float in_plane = sqrtf(s_base_ax * s_base_ax + s_base_ay * s_base_ay);
-            s_is_vertical_mount = (in_plane > 4000.0f);
-        }
-        s_filtered_roll  = 0.0f;
-        s_filtered_pitch = 0.0f;
-        s_current_motion = IMU_MOTION_LEVEL;
-        s_heading_deg    = 0.0f;
-    }
-    display_set_imu_override_direction(NAV_DIR_NONE);
-    ESP_LOGI(TAG, "IMU baseline reset to current orientation");
+    mpu6500_request_calibration();
 }
 
 // =============================================================================
@@ -245,6 +270,8 @@ void mpu6500_reset_heading(void) {
 // =============================================================================
 
 esp_err_t mpu6500_init(void) {
+    s_sensor_available = false;
+    s_calibration_complete = false;
     ESP_LOGI(TAG, "Initialising MPU6500 (I2C SDA=GPIO%d SCL=GPIO%d addr=0x%02X)",
              MPU6500_I2C_SDA_PIN, MPU6500_I2C_SCL_PIN, MPU6500_I2C_ADDR);
 
@@ -459,33 +486,40 @@ esp_err_t mpu6500_init(void) {
 
     // Step 2: Wake from sleep
     ESP_LOGI(TAG, "Step 2: Waking from sleep...");
-    i2c_write_reg(MPU6500_REG_PWR_MGMT_1, 0x00);
+    ret = i2c_write_reg(MPU6500_REG_PWR_MGMT_1, 0x00);
+    if (ret != ESP_OK) return ret;
     vTaskDelay(pdMS_TO_TICKS(100));
-    i2c_write_reg(MPU6500_REG_PWR_MGMT_1, 0x01);
+    ret = i2c_write_reg(MPU6500_REG_PWR_MGMT_1, 0x01);
+    if (ret != ESP_OK) return ret;
     vTaskDelay(pdMS_TO_TICKS(30));
 
     // Step 3: Enable ALL axes
     ESP_LOGI(TAG, "Step 3: Enabling all axes...");
-    i2c_write_reg(MPU6500_REG_PWR_MGMT_2, 0x00);
+    ret = i2c_write_reg(MPU6500_REG_PWR_MGMT_2, 0x00);
+    if (ret != ESP_OK) return ret;
     vTaskDelay(pdMS_TO_TICKS(10));
 
     // Step 3.5: Signal path reset & test gyro response
-    i2c_write_reg(0x68, 0x07);
+    ret = i2c_write_reg(0x68, 0x07);
+    if (ret != ESP_OK) return ret;
     vTaskDelay(pdMS_TO_TICKS(100));
-    i2c_write_reg(0x6A, 0x01);
+    ret = i2c_write_reg(0x6A, 0x01);
+    if (ret != ESP_OK) return ret;
     vTaskDelay(pdMS_TO_TICKS(100));
-    i2c_write_reg(MPU6500_REG_PWR_MGMT_1, 0x01);
-    i2c_write_reg(MPU6500_REG_PWR_MGMT_2, 0x00);
+    ret = i2c_write_reg(MPU6500_REG_PWR_MGMT_1, 0x01);
+    if (ret != ESP_OK) return ret;
+    ret = i2c_write_reg(MPU6500_REG_PWR_MGMT_2, 0x00);
+    if (ret != ESP_OK) return ret;
     vTaskDelay(pdMS_TO_TICKS(50));
 
     uint8_t gyro_test[6];
     memset(gyro_test, 0, 6);
-    i2c_read_reg(0x43, gyro_test, 6);
+    ret = i2c_read_reg(0x43, gyro_test, 6);
     int16_t gx_test = (int16_t)((gyro_test[0] << 8) | gyro_test[1]);
     int16_t gy_test = (int16_t)((gyro_test[2] << 8) | gyro_test[3]);
     int16_t gz_test = (int16_t)((gyro_test[4] << 8) | gyro_test[5]);
 
-    if (gx_test != 0 || gy_test != 0 || gz_test != 0) {
+    if (ret == ESP_OK && (gx_test != 0 || gy_test != 0 || gz_test != 0)) {
         s_gyro_available = true;
         ESP_LOGI(TAG, "Gyroscope is LIVE (X=%d Y=%d Z=%d)", gx_test, gy_test, gz_test);
     } else {
@@ -499,13 +533,18 @@ esp_err_t mpu6500_init(void) {
 
     // Step 4: Configure Accelerometer & Sample Rate
     ESP_LOGI(TAG, "Step 4: Configuring sensors...");
-    i2c_write_reg(MPU6500_REG_SMPLRT_DIV, 0x09);      // 100 Hz internal sample rate
-    i2c_write_reg(MPU6500_REG_ACCEL_CONFIG, 0x00);    // +/- 2g range (16384 LSB/g)
-    i2c_write_reg(MPU6500_REG_ACCEL_CONFIG_2, 0x03);  // 41 Hz DLPF (filters road vibration)
+    ret = i2c_write_reg(MPU6500_REG_SMPLRT_DIV, 0x09);
+    if (ret != ESP_OK) return ret;      // 100 Hz internal sample rate
+    ret = i2c_write_reg(MPU6500_REG_ACCEL_CONFIG, 0x00);
+    if (ret != ESP_OK) return ret;    // +/- 2g range (16384 LSB/g)
+    ret = i2c_write_reg(MPU6500_REG_ACCEL_CONFIG_2, 0x03);
+    if (ret != ESP_OK) return ret;  // 41 Hz DLPF (filters road vibration)
 
     if (s_gyro_available) {
-        i2c_write_reg(MPU6500_REG_CONFIG, 0x03);       // DLPF 42 Hz
-        i2c_write_reg(MPU6500_REG_GYRO_CONFIG, 0x08);  // +/-500 deg/s
+        ret = i2c_write_reg(MPU6500_REG_CONFIG, 0x03);
+        if (ret != ESP_OK) return ret;       // DLPF 42 Hz
+        ret = i2c_write_reg(MPU6500_REG_GYRO_CONFIG, 0x08);
+        if (ret != ESP_OK) return ret;  // +/-500 deg/s
     }
 
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -516,6 +555,8 @@ esp_err_t mpu6500_init(void) {
     ESP_LOGI(TAG, "Step 5: Live sensor test -> Accel: X=%6d  Y=%6d  Z=%6d (ret=%s)",
              ax, ay, az, esp_err_to_name(ret));
 
+    if (ret != ESP_OK || !accel_sample_valid(ax, ay, az)) return ret != ESP_OK ? ret : ESP_ERR_INVALID_RESPONSE;
+    s_sensor_available = true;
     s_heading_deg    = 0.0f;
     s_filtered_roll  = 0.0f;
     s_filtered_pitch = 0.0f;
@@ -556,54 +597,84 @@ static const char *dir_to_str(nav_direction_t d) {
 // IMU TASK — 50 Hz sensing -> display_set_imu_override_direction()
 // =============================================================================
 
-static void imu_task(void *pvParam) {
-    // -------------------------------------------------------------------------
-    // Phase 1: Baseline Calibration (40 samples = 800 ms)
-    // -------------------------------------------------------------------------
-    ESP_LOGI(TAG, "Calibrating baseline (keep device resting for 800ms)...");
-    float sum_ax = 0.0f, sum_ay = 0.0f, sum_az = 0.0f;
-    float sum_gz = 0.0f;
-    const int CALIB_SAMPLES = 40;
-
-    for (int i = 0; i < CALIB_SAMPLES; i++) {
-        int16_t ax = 0, ay = 0, az = 0;
-        mpu6500_read_accel(&ax, &ay, &az);
-        sum_ax += (float)ax;
-        sum_ay += (float)ay;
-        sum_az += (float)az;
-
-        if (s_gyro_available) {
-            int16_t gz = 0;
-            mpu6500_read_gyro_z(&gz);
-            sum_gz += (float)gz;
-        }
-        vTaskDelay(pdMS_TO_TICKS(IMU_TASK_PERIOD_MS));
+// Collect one calibration sample per task tick. Live sensing continues using
+// the last accepted baseline while a new stationary window is collected.
+static void calibration_step(bool begin) {
+    static float sums[4];
+    static int16_t lo[4], hi[4];
+    static int count, gyro_count, attempts;
+    if (begin) {
+        s_calibrating = true;
+        count=0; gyro_count=0; attempts=0;
+        memset(sums,0,sizeof(sums));
+        mpu6500_publish_status();
     }
+    // Keep the last accepted baseline usable if this attempt is interrupted by
+    // movement. Only replace it after a complete stationary sample window.
+    int16_t sample[4] = {0};
+    bool ok = mpu6500_read_accel(&sample[0], &sample[1], &sample[2]) == ESP_OK &&
+              accel_sample_valid(sample[0], sample[1], sample[2]);
+    bool gyro_ok = s_gyro_available && mpu6500_read_gyro_z(&sample[3]) == ESP_OK && abs(sample[3]) < 655;
+    if (!ok) { count = 0; gyro_count=0; memset(sums,0,sizeof(sums)); }
+    else {
+        if (!count) for (int i=0;i<4;i++) { lo[i]=sample[i]; hi[i]=sample[i]; }
+        bool steady = true;
+        for (int i=0;i<4;i++) {
+            if (sample[i] < lo[i]) lo[i]=sample[i];
+            if (sample[i] > hi[i]) hi[i]=sample[i];
+            if (i < 3 && (int)hi[i] - lo[i] > 1800) steady=false;
+        }
+        if (!steady) { count=0; gyro_count=0; memset(sums,0,sizeof(sums)); }
+        else {
+            for (int i=0;i<3;i++) sums[i]+=sample[i];
+            if (gyro_ok) { sums[3]+=sample[3]; gyro_count++; }
+            count++;
+        }
+    }
+    if (++attempts < 120 && count < 40) return;
+    if (count == 40) {
+        s_base_ax=sums[0]/40; s_base_ay=sums[1]/40; s_base_az=sums[2]/40;
+        if (s_gyro_available && (gyro_count != 40 || (int)hi[3]-lo[3] > 160)) {
+            s_gyro_available=false;
+            ESP_LOGW(TAG,"Gyro calibration unavailable; accelerometer remains active");
+        }
+        s_gyro_z_bias=s_gyro_available ? sums[3]/40 : 0;
+        s_auto_calibration=false;
+        s_is_vertical_mount=hypotf(s_base_ax,s_base_ay)>4000;
+        s_filtered_roll=0; s_filtered_pitch=0; s_heading_deg=0;
+        s_last_sample_us=esp_timer_get_time(); s_read_error=false;
+        s_calibration_complete=true;
+        display_set_imu_override_direction(NAV_DIR_NONE);
+        ESP_LOGI(TAG,"Calibration accepted: ax=%.0f ay=%.0f az=%.0f",s_base_ax,s_base_ay,s_base_az);
+    } else ESP_LOGW(TAG,"Calibration rejected: keep still and retry; valid stationary samples=%d",count);
+    s_calibrating=false;
+    s_next_auto_calibration_us=esp_timer_get_time()+5000000;
+    mpu6500_publish_status();
 
-    s_base_ax = sum_ax / (float)CALIB_SAMPLES;
-    s_base_ay = sum_ay / (float)CALIB_SAMPLES;
-    s_base_az = sum_az / (float)CALIB_SAMPLES;
-    s_gyro_z_bias = sum_gz / (float)CALIB_SAMPLES;
-    s_calibration_complete = true;
+}
 
-    float in_plane = sqrtf(s_base_ax * s_base_ax + s_base_ay * s_base_ay);
-    s_is_vertical_mount = (in_plane > 4000.0f);
-
-    ESP_LOGI(TAG, "Baseline Accel: X=%.0f Y=%.0f Z=%.0f (Mount: %s)",
-             s_base_ax, s_base_ay, s_base_az,
-             s_is_vertical_mount ? "Vertical / Cockpit Mount" : "Flat / Horizontal Mount");
-
-    display_set_imu_override_direction(NAV_DIR_NONE);
-
-    // -------------------------------------------------------------------------
-    // Phase 2: Continuous 50 Hz task
-    // -------------------------------------------------------------------------
-    ESP_LOGI(TAG, "IMU task running at 50 Hz");
-
+static void imu_task(void *pvParam) {
+    s_auto_calibration = true;
+    s_calibration_requested = true;
     uint32_t log_counter = 0;
     int64_t previous_sample_us = esp_timer_get_time();
 
+    int64_t last_publish_us=0;
+    TickType_t sample_wake = xTaskGetTickCount();
     while (1) {
+        if (esp_timer_get_time()-last_publish_us >= 200000) {
+            mpu6500_publish_status();
+            last_publish_us=esp_timer_get_time();
+        }
+        if (s_auto_calibration && !s_calibrating && esp_timer_get_time()>=s_next_auto_calibration_us)
+            s_calibration_requested=true;
+        if (s_calibration_requested) {
+            s_calibration_requested = false;
+            calibration_step(true);
+        } else if (s_calibrating) {
+            calibration_step(false);
+        }
+        if (!s_calibration_complete) { vTaskDelayUntil(&sample_wake,pdMS_TO_TICKS(IMU_TASK_PERIOD_MS)); continue; }
         const int64_t sample_now_us = esp_timer_get_time();
         float measured_dt = (float)(sample_now_us - previous_sample_us) / 1000000.0f;
         previous_sample_us = sample_now_us;
@@ -633,11 +704,14 @@ static void imu_task(void *pvParam) {
             } else {
                 vTaskDelay(pdMS_TO_TICKS(50));
             }
-        } else {
-            // Accelerometer 4-Direction Sensing Mode
+        }
+        {
+            // Always sample tilt, including on boards with a functional gyroscope.
             int16_t ax = 0, ay = 0, az = 0;
             esp_err_t ret = mpu6500_read_accel(&ax, &ay, &az);
             if (ret == ESP_OK && accel_sample_valid(ax, ay, az)) {
+                s_last_sample_us = esp_timer_get_time();
+                s_read_error = false;
 #if MPU6500_DIAGNOSTIC_MODE
                 diagnostic_record_accel(ax, ay, az);
 #endif
@@ -677,7 +751,7 @@ static void imu_task(void *pvParam) {
 #endif
 
                 // Time-normalized exponential low-pass filter. At the normal
-                // 20ms cadence alpha is 0.25, matching the existing behavior,
+                // 20ms cadence alpha is 0.5 for a quick local response,
                 // but timing jitter no longer changes the effective cutoff.
                 float filter_alpha = measured_dt /
                                      (ACCEL_FILTER_TAU_SEC + measured_dt);
@@ -735,7 +809,7 @@ static void imu_task(void *pvParam) {
                 float heading = s_filtered_roll;
                 if (heading < 0.0f)   heading += 360.0f;
                 if (heading >= 360.0f) heading -= 360.0f;
-                s_heading_deg = heading;
+                if (!s_gyro_available) s_heading_deg = heading;
 
                 log_counter++;
                 if (log_counter >= 50) {
@@ -746,15 +820,22 @@ static void imu_task(void *pvParam) {
                              dir_to_str(target_dir));
                 }
             } else {
+                if (esp_timer_get_time() - s_last_sample_us > 500000) {
+                    s_read_error = true;
+                    s_current_motion = IMU_MOTION_LEVEL;
+                    display_set_imu_override_direction(NAV_DIR_NONE);
+                }
                 vTaskDelay(pdMS_TO_TICKS(50));
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(IMU_TASK_PERIOD_MS));
+        vTaskDelayUntil(&sample_wake,pdMS_TO_TICKS(IMU_TASK_PERIOD_MS));
     }
 }
 
 void mpu6500_start_task(void) {
-    xTaskCreate(imu_task, "imu_task", 3072, NULL, 4, NULL);
-    ESP_LOGI(TAG, "IMU task started");
+    if (!s_sensor_available || s_imu_task) return;
+    BaseType_t result = xTaskCreate(imu_task, "imu_task", 4096, NULL, 4, &s_imu_task);
+    if (result != pdPASS) { s_sensor_available=false; ESP_LOGE(TAG,"IMU task creation failed"); }
+    else ESP_LOGI(TAG, "IMU task started");
 }
