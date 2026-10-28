@@ -110,3 +110,11 @@ backgrounds, emerald accents and off-white text. Traffic signs and warnings
 retain semantic colors. Rebuild/flash firmware to apply palette changes; no
 APK change is required. RGB565 quantization and LCD characteristics affect
 the exact physical color appearance.
+
+## 1.75-inch round display
+
+The default display profile now targets the CO5300/CST9217 round module.
+See [ROUND_DISPLAY_PORT.md](ROUND_DISPLAY_PORT.md) for wiring, panel-startup
+validation requirements, retained phone protocols, and the production-C UI
+preview command (`python tools/preview_round.py`). Disable the round profile
+in menuconfig to build for the original 2.8-inch display.

@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include "esp_err.h"
 #include "driver/spi_master.h"
+#include "sdkconfig.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -103,10 +104,15 @@ typedef enum {
 // DRIVER APIS
 // =============================================================================
 esp_err_t tft_init(void);
+// Round profile: full 320-square canvas; false selects the safe legacy pane.
+void tft_set_round_canvas(bool round);
+bool tft_is_round_canvas(void);
 void tft_set_backlight(uint8_t brightness_pct);
 void tft_set_rotation(uint8_t rotation);
 void tft_fill_screen(uint16_t color);
 void tft_draw_pixel(int x, int y, uint16_t color);
+// Alpha 0..15 over the current buffered-region background (no panel readback).
+void tft_blend_pixel(int x,int y,uint16_t color,unsigned alpha);
 void tft_draw_fast_h_line(int x, int y, int w, uint16_t color);
 void tft_draw_fast_v_line(int x, int y, int h, uint16_t color);
 void tft_fill_rect(int x, int y, int w, int h, uint16_t color);

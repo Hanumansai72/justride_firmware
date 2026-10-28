@@ -1,0 +1,49 @@
+menu "JustRide display"
+config JUSTRIDE_ROUND_AMOLED
+    bool "1.75-inch H0175Y003AMT003 (466x466 CO5300 / CST9217)"
+    default y
+    help
+        Disable to build the original 2.8-inch ILI9341 / XPT2046 firmware.
+        GPIO assignments below are host-board wiring, not FPC pin numbers.
+if JUSTRIDE_ROUND_AMOLED
+config JR_QSPI_D0
+    int "QSPI D0 GPIO (FPC 16)"
+    default 23
+config JR_QSPI_D1
+    int "QSPI D1 GPIO (FPC 17)"
+    default 19
+config JR_QSPI_D2
+    int "QSPI D2 GPIO (FPC 20)"
+    default 25
+config JR_QSPI_D3
+    int "QSPI D3 GPIO (FPC 19)"
+    default 26
+config JR_QSPI_CLK
+    int "QSPI clock GPIO (FPC 18)"
+    default 18
+config JR_QSPI_CS
+    int "QSPI CS GPIO (FPC 15)"
+    default 5
+config JR_PANEL_RST
+    int "Display reset GPIO (FPC 14)"
+    default 4
+config JR_TOUCH_SDA
+    int "Touch SDA GPIO (FPC 4)"
+    default 32
+config JR_TOUCH_SCL
+    int "Touch SCL GPIO (FPC 5)"
+    default 33
+config JR_TOUCH_RST
+    int "Touch reset GPIO (FPC 3)"
+    default 27
+config JR_TOUCH_IRQ
+    int "Touch interrupt GPIO (FPC 2)"
+    default 14
+config JR_TOUCH_SWAP_XY
+    bool "Swap touch X/Y for assembly orientation"
+config JR_TOUCH_MIRROR_X
+    bool "Mirror touch X"
+config JR_TOUCH_MIRROR_Y
+    bool "Mirror touch Y"
+endif
+endmenu

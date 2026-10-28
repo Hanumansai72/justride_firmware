@@ -51,6 +51,10 @@ void map_frame_invalidate(void) {
   status = 0;
 }
 bool map_frame_active(void) { return receiving || valid || on_screen; }
+const uint8_t *map_frame_snapshot(unsigned *w,unsigned *h,unsigned *x,unsigned *y) {
+  if(!valid || receiving)return NULL;
+  *w=source_w;*h=source_h;*x=marker_x;*y=marker_y;return pixels;
+}
 const char *map_frame_status(void) {
   return status == 0   ? "MAP LOAD"
          : status == 2 ? "MAP ERROR"
@@ -131,6 +135,7 @@ bool map_frame_packet(const uint8_t *p, size_t len) {
       return false;
     }
     valid = true;
+    paint_serial++;
     dirty = true;
     status = 1;
     marker_x = source_w / 2;
@@ -158,6 +163,7 @@ bool map_frame_packet(const uint8_t *p, size_t len) {
     marker_y = u16(p + 5);
     heading = u16(p + 7);
     marker_dirty = true;
+    marker_serial++;
     if (status == 4)
       status = 1;
     return true;

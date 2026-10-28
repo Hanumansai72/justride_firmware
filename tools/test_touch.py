@@ -18,6 +18,7 @@ OUT.mkdir(parents=True, exist_ok=True)
 (OUT / 'driver').mkdir(exist_ok=True)
 
 headers = {
+    'sdkconfig.h': '#pragma once\n#define CONFIG_JUSTRIDE_ROUND_AMOLED 0\n',
     'stdint.h': '#pragma once\ntypedef unsigned char uint8_t; typedef short int16_t; typedef unsigned short uint16_t; typedef unsigned int uint32_t; typedef unsigned long long uint64_t;\n',
     'stddef.h': '#pragma once\ntypedef unsigned long long size_t;\n#define NULL ((void*)0)\n',
     'stdbool.h': '#pragma once\n#define bool _Bool\n#define true 1\n#define false 0\n',
@@ -114,6 +115,9 @@ static void driver_checks(void){
    reset();raw_x=i?3600:800;raw_y=i?3500:1200;
    int px=(int)((float)((int)raw_x-TOUCH_RAW_MIN_X)*240.0f/(TOUCH_RAW_MAX_X-TOUCH_RAW_MIN_X));
    int py=(int)((float)((int)raw_y-TOUCH_RAW_MIN_Y)*320.0f/(TOUCH_RAW_MAX_Y-TOUCH_RAW_MIN_Y));
+#if TOUCH_INVERT_RAW_X
+   px=239-px;
+#endif
    CHECK(touch_get_point(&p));
 #if DISPLAY_ROTATION==TFT_ROTATION_LANDSCAPE
    CHECK(p.x==319-py && p.y==px);
@@ -178,6 +182,7 @@ fsm = fsm.replace('while (1)', 'while (frame_index < frame_count)')
 harness = harness.replace('FSM_SOURCE', fsm)
 (OUT / 'driver_tests.c').write_text(harness, encoding='utf-8')
 (OUT / 'touch.h').write_text((args.source / 'touch.h').read_text(encoding='utf-8'), encoding='utf-8')
+(OUT / 'display_theme.h').write_text((args.source / 'display_theme.h').read_text(encoding='utf-8'), encoding='utf-8')
 (OUT / 'touch.c').write_text((args.source / 'touch.c').read_text(encoding='utf-8'), encoding='utf-8')
 compilers = sorted(Path('C:/Program Files (x86)/Microsoft Visual Studio').glob(
     '*/BuildTools/VC/Tools/MSVC/*/bin/Hostx64/x64/cl.exe'))

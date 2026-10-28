@@ -10,6 +10,8 @@ bool map_frame_packet(const uint8_t *p, size_t len);
 void map_frame_invalidate(void);
 bool map_frame_draw(bool force);
 bool map_frame_active(void);
+// Read-only snapshot for the round compositor, under the existing UI lock.
+const uint8_t *map_frame_snapshot(unsigned *w,unsigned *h,unsigned *x,unsigned *y);
 const char *map_frame_status(void);
 
 // Visual device tilt; does not change GPS heading or route data.

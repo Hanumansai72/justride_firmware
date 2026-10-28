@@ -149,7 +149,11 @@ void app_main(void)
     ESP_LOGI(TAG, "Boot reset reason: %d", (int)esp_reset_reason());
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "       JustRide Motorcycle Device       ");
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    ESP_LOGI(TAG, "  1.75\" CO5300 AMOLED / CST9217 touch  ");
+#else
     ESP_LOGI(TAG, "     2.8\" TFT SPI HUD & Dual OTA       ");
+#endif
     ESP_LOGI(TAG, "========================================");
 
     // --------------------------------------------------

@@ -39,3 +39,5 @@ void hud_call(const char *caller, uint8_t actions, bool connected);
 void hud_text(int x, int y, const char *text, unsigned size, uint16_t fg,
               uint16_t bg, int max_width);
 int hud_text_width(const char *text, unsigned size);
+// Use inside a buffered region to preserve the map underneath glyph edges.
+void hud_text_overlay(int x,int y,const char *text,unsigned size,uint16_t fg,int max_width);

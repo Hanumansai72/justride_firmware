@@ -6,11 +6,15 @@
 #include "driver/ledc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+#include "round_panel.h"
+#endif
 
+#if !CONFIG_JUSTRIDE_ROUND_AMOLED
 static const char *TAG = "DISPLAY_TFT";
-
 static spi_device_handle_t s_spi = NULL;
 static esp_err_t s_spi_error = ESP_OK;
+#endif
 static uint16_t s_width = DISPLAY_WIDTH;
 static uint16_t s_height = DISPLAY_HEIGHT;
 static SemaphoreHandle_t s_spi_mutex = NULL;
@@ -132,6 +136,7 @@ static const uint8_t font5x8[][5] = {
 // LOW-LEVEL SPI COMMAND & DATA TRANSMISSION
 // =============================================================================
 
+#if !CONFIG_JUSTRIDE_ROUND_AMOLED
 static void tft_send_cmd(uint8_t cmd) {
     tft_spi_lock();
     gpio_set_level(TFT_PIN_DC, 0); // Command mode
@@ -187,7 +192,17 @@ static void tft_set_addr_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t 
     tft_send_cmd(0x2C); // Memory Write (RAMWR)
 }
 
+#else
+static void tft_send_data(const uint8_t *data,int len) {
+    if(len>0)round_panel_pixels(data,len);
+}
+static void tft_set_addr_window(uint16_t x0,uint16_t y0,uint16_t x1,uint16_t y1) {
+    round_panel_window(x0,y0,x1-x0+1,y1-y0+1);
+}
+#endif
+
 // Configure Backlight with LEDC hardware PWM
+#if !CONFIG_JUSTRIDE_ROUND_AMOLED
 #if (TFT_PIN_BCKL >= 0)
 static void tft_backlight_init(void) {
     ledc_timer_config_t ledc_timer = {
@@ -212,8 +227,12 @@ static void tft_backlight_init(void) {
     ESP_LOGI(TAG, "LEDC Backlight PWM configured on GPIO %d (5 kHz)", TFT_PIN_BCKL);
 }
 #endif
+#endif
 
 void tft_set_backlight(uint8_t brightness_pct) {
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    round_panel_brightness(brightness_pct);
+#else
 #if (TFT_PIN_BCKL >= 0)
     if (brightness_pct > 100) brightness_pct = 100;
     // Map 0-100% to 10-bit duty cycle (0-1023)
@@ -222,6 +241,7 @@ void tft_set_backlight(uint8_t brightness_pct) {
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
     ESP_LOGI(TAG, "Hardware Backlight set to %d%% (Duty: %lu/1023)", brightness_pct, duty);
 #endif
+#endif
 }
 
 // =============================================================================
@@ -229,6 +249,11 @@ void tft_set_backlight(uint8_t brightness_pct) {
 // =============================================================================
 
 esp_err_t tft_init(void) {
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    s_spi_mutex=xSemaphoreCreateRecursiveMutex();
+    if(!s_spi_mutex)return ESP_ERR_NO_MEM;
+    return round_panel_init();
+#else
     ESP_LOGI(TAG, "Initializing 2.8\" SPI TFT (ILI9341 240x320)...");
 
     if (!s_spi_mutex) {
@@ -337,6 +362,7 @@ esp_err_t tft_init(void) {
     if (s_spi_error != ESP_OK) return s_spi_error;
     ESP_LOGI(TAG, "TFT initialization complete. Mode: Landscape %dx%d.", s_width, s_height);
     return ESP_OK;
+#endif
 }
 
 spi_host_device_t tft_get_spi_host(void) {
@@ -344,6 +370,10 @@ spi_host_device_t tft_get_spi_host(void) {
 }
 
 void tft_set_rotation(uint8_t rotation) {
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    // Round module is mounted portrait; touch mirroring is board-configurable.
+    (void)rotation;
+#else
     tft_send_cmd(0x36); // Memory Access Control (MADCTL)
     uint8_t madctl = 0;
     switch (rotation % 4) {
@@ -369,6 +399,25 @@ void tft_set_rotation(uint8_t rotation) {
             break;
     }
     tft_send_byte(madctl);
+#endif
+}
+
+void tft_set_round_canvas(bool round) {
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    tft_spi_lock();
+    round_panel_canvas(round);
+    s_height=round?320:DISPLAY_HEIGHT;
+    tft_spi_unlock();
+#else
+    (void)round;
+#endif
+}
+bool tft_is_round_canvas(void) {
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    return round_panel_is_round();
+#else
+    return false;
+#endif
 }
 
 // =============================================================================
@@ -417,6 +466,19 @@ void tft_draw_pixel(int x, int y, uint16_t color) {
     uint8_t data[2] = { (color >> 8) & 0xFF, color & 0xFF };
     tft_send_data(data, 2);
     tft_spi_unlock();
+}
+
+void tft_blend_pixel(int x,int y,uint16_t color,unsigned alpha) {
+    if(!alpha || !tile_active() || x<s_tile.x || y<s_tile.y ||
+       x>=s_tile.x+s_tile.w || y>=s_tile.y+s_tile.h)return;
+    unsigned at=((y-s_tile.y)*s_tile.w+x-s_tile.x)*2;
+    uint16_t bg=((uint16_t)s_hud_strip[at]<<8)|s_hud_strip[at+1];
+    if(alpha>15)alpha=15;
+    unsigned r=(((bg>>11)&31)*(15-alpha)+((color>>11)&31)*alpha)/15;
+    unsigned g=(((bg>>5)&63)*(15-alpha)+((color>>5)&63)*alpha)/15;
+    unsigned b=((bg&31)*(15-alpha)+(color&31)*alpha)/15;
+    uint16_t out=(r<<11)|(g<<5)|b;
+    s_hud_strip[at]=out>>8;s_hud_strip[at+1]=out;
 }
 
 
