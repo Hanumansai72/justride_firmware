@@ -165,6 +165,8 @@ static bool s_map_drawn = false;
 // Navigation Camera & Zoom Engine
 static nav_camera_mode_t s_camera_mode = NAV_CAMERA_FOLLOW;
 static nav_zoom_level_t s_zoom_level = NAV_ZOOM_LEVEL_2; // Closer live follow view
+static bool s_zoom_pending;
+static int64_t s_zoom_due_us;
 static int16_t s_pan_offset_x = 0;
 static int16_t s_pan_offset_y = 0;
 
@@ -702,8 +704,14 @@ void display_show_home_screen(void) {
 // ── 4. ROTATED RIDER CHEVRON (Large Map Area: cx=220, cy=146)
 // ─────────────
 static void draw_hud_rider_chevron(float angle_rad) {
-  const float cx = 207.0f;
-  const float cy = 148.0f;
+  bool overview=s_route_seg.camera_projected && s_route_seg.overview && s_route_seg.count;
+  const float cx = overview?207+((int)s_route_seg.points[0].x-160)*0.9f:207;
+  const float cy = overview?148+((int)s_route_seg.points[0].y-160)*0.9f:148;
+  if(overview) {
+    tft_fill_circle(lroundf(cx),lroundf(cy),5,COLOR_NAV_ROUTE);
+    tft_fill_circle(lroundf(cx),lroundf(cy),3,COLOR_WHITE);
+    return;
+  }
   const float cos_a = cosf(angle_rad);
   const float sin_a = sinf(angle_rad);
 
@@ -763,9 +771,11 @@ static void draw_hud_rider_marker(nav_direction_t dir) {
   (void)dir;
   s_drawn_motion_degrees=(int)lroundf(rider_motion_degrees()/2)*2;
   // Restore the actual road beneath the marker; never punch a blank hole in it.
+  if(s_route_seg.overview && s_route_seg.camera_projected)return;
   paint_route_region(184, 125, 47, 47);
 }
 static int route_zoom_percent(void) {
+  if(s_route_seg.camera_projected)return 100;
   switch (s_zoom_level) {
   case NAV_ZOOM_LEVEL_1: return 150;
   case NAV_ZOOM_LEVEL_2: return 100;
@@ -1551,6 +1561,12 @@ void display_prev_screen(void) {
 // GESTURE & TOUCH EVENT HANDLER
 // =============================================================================
 static void handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x, int16_t end_y, touch_gesture_t gesture);
+bool display_nav_touch_zoom_allowed(int16_t x,int16_t y) {
+  // Read-only hint for the touch FSM; the UI-locked handler rechecks it.
+  return s_current_screen==SCREEN_NAV && s_nav.is_navigating &&
+      s_call.state!=1 && !s_show_route_resume_modal &&
+      x>=104 && x<284 && y>=40 && y<160;
+}
 void display_handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x, int16_t end_y, touch_gesture_t gesture) {
   if (!s_display_mutex) return;
   xSemaphoreTakeRecursive(s_display_mutex, portMAX_DELAY);
@@ -1576,6 +1592,14 @@ static void handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x,
     return;
   }
   switch (gesture) {
+  case TOUCH_GESTURE_DOUBLE_TAP:
+  case TOUCH_GESTURE_ZOOM_IN:
+  case TOUCH_GESTURE_ZOOM_OUT:
+    if(display_nav_touch_zoom_allowed(start_x,start_y)) {
+      if(gesture==TOUCH_GESTURE_ZOOM_OUT)display_nav_zoom_out();
+      else display_nav_zoom_in();
+    }
+    break;
   case TOUCH_GESTURE_SWIPE_LEFT:
     // Dismiss confirmation modal on swipe
     s_show_reset_confirm = false;
@@ -1713,8 +1737,7 @@ static void handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x,
     // Compass returns the actual map camera to the rider; trip card fits route.
     if(s_current_screen==SCREEN_NAV) {
       if(tx>=288 && ty>=142 && ty<=171){display_nav_recenter();return;}
-      if(tx>=245 && ty<=38){s_camera_mode=NAV_CAMERA_OVERVIEW;s_zoom_level=NAV_ZOOM_LEVEL_5;
-        uint8_t packet[2]={0x14,255};ble_nav_notify_diagnostic_packet(packet,sizeof(packet));return;}
+      if(tx>=245 && ty<=38){display_nav_toggle_overview();return;}
       return;
     }
 
@@ -1971,6 +1994,8 @@ static void nav_render_task(void *pvParam) {
       bool connected;
       if (xQueueReceive(s_connection_queue, &connected, 0) == pdTRUE) {
         s_ble_connected = connected;
+        map_frame_reset_session();
+        if(connected && s_nav.is_navigating){s_zoom_pending=true;s_zoom_due_us=esp_timer_get_time()+500000;}
         s_call_painted=false;
         s_phone_state_ready = false;
         s_media = (media_state_t){.state = 6};
@@ -1989,6 +2014,7 @@ static void nav_render_task(void *pvParam) {
         bool geometry_changed=segment.count!=s_route_seg.count ||
           segment.completed_segment_count!=s_route_seg.completed_segment_count ||
           segment.is_destination_visible!=s_route_seg.is_destination_visible ||
+          segment.camera_projected!=s_route_seg.camera_projected || segment.overview!=s_route_seg.overview ||
           segment.dest_x!=s_route_seg.dest_x || segment.dest_y!=s_route_seg.dest_y ||
           memcmp(segment.points,s_route_seg.points,sizeof(segment.points))!=0;
         s_route_seg = segment;
@@ -2011,6 +2037,12 @@ static void nav_render_task(void *pvParam) {
         restore_call=s_call.state==1 && call.state!=1;
         if(memcmp(&s_call,&call,sizeof(call)))s_call_painted=false;
         s_call=call;
+      }
+      if(s_zoom_pending && s_ble_connected && s_phone_state_ready && s_nav.is_navigating &&
+          esp_timer_get_time()>=s_zoom_due_us) {
+        uint8_t packet[2]={0x14,s_camera_mode==NAV_CAMERA_OVERVIEW?255:(uint8_t)(18-(int)s_zoom_level)};
+        if(ble_nav_notify_diagnostic_packet(packet,sizeof(packet)))s_zoom_pending=false;
+        else s_zoom_due_us=esp_timer_get_time()+500000;
       }
       if(s_call.state==1 && s_current_screen!=SCREEN_OTA) {
         if(!s_call_painted){hud_call(s_call.caller,s_call.actions,s_ble_connected);s_call_painted=true;}
@@ -2257,8 +2289,15 @@ void display_clear(void) {
 // =============================================================================
 // NAVIGATION CAMERA & ZOOM CONTROLS IMPLEMENTATION
 // =============================================================================
+static void nav_zoom_changed(void) {
+  // A drag can select several levels before the 20 Hz UI task sends only
+  // its latest choice. No rendering or BLE work runs in the touch poller.
+  s_zoom_pending=true;s_zoom_due_us=esp_timer_get_time()+250000;
+  if(s_is_initialized && s_current_screen==SCREEN_NAV)s_route_seg_dirty=true;
+}
 
 void display_nav_zoom_in(void) {
+  if(s_zoom_level==NAV_ZOOM_LEVEL_1 && s_camera_mode==NAV_CAMERA_FOLLOW)return;
   if (s_camera_mode == NAV_CAMERA_OVERVIEW) {
     // Exit overview back to wide context (Level 4)
     s_camera_mode = NAV_CAMERA_FOLLOW;
@@ -2266,17 +2305,12 @@ void display_nav_zoom_in(void) {
   } else if (s_zoom_level > NAV_ZOOM_LEVEL_1) {
     s_zoom_level = (nav_zoom_level_t)((int)s_zoom_level - 1);
   }
-  if (map_frame_active()) {
-    uint8_t zoom_packet[2] = {0x14, s_camera_mode == NAV_CAMERA_OVERVIEW ? 255 : (uint8_t)(18 - (int)s_zoom_level)};
-    ble_nav_notify_diagnostic_packet(zoom_packet, sizeof(zoom_packet));
-  }
+  nav_zoom_changed();
   ESP_LOGI(TAG, "Nav Zoom In: Level %d", (int)s_zoom_level);
-  if (s_is_initialized && s_current_screen == SCREEN_NAV) {
-    s_route_seg_dirty = true;
-  }
 }
 
 void display_nav_zoom_out(void) {
+  if(s_zoom_level==NAV_ZOOM_LEVEL_5)return;
   if (s_zoom_level < NAV_ZOOM_LEVEL_4) {
     s_zoom_level = (nav_zoom_level_t)((int)s_zoom_level + 1);
   } else {
@@ -2284,15 +2318,9 @@ void display_nav_zoom_out(void) {
     s_camera_mode = NAV_CAMERA_OVERVIEW;
     s_zoom_level = NAV_ZOOM_LEVEL_5;
   }
-  if (map_frame_active()) {
-    uint8_t zoom_packet[2] = {0x14, s_camera_mode == NAV_CAMERA_OVERVIEW ? 255 : (uint8_t)(18 - (int)s_zoom_level)};
-    ble_nav_notify_diagnostic_packet(zoom_packet, sizeof(zoom_packet));
-  }
+  nav_zoom_changed();
   ESP_LOGI(TAG, "Nav Zoom Out: Level %d, Mode %d", (int)s_zoom_level,
            (int)s_camera_mode);
-  if (s_is_initialized && s_current_screen == SCREEN_NAV) {
-    s_route_seg_dirty = true;
-  }
 }
 
 void display_nav_recenter(void) {
@@ -2300,14 +2328,8 @@ void display_nav_recenter(void) {
   s_zoom_level = NAV_ZOOM_LEVEL_2; // Close heading-up follow view
   s_pan_offset_x = 0;
   s_pan_offset_y = 0;
-  if (map_frame_active()) {
-    uint8_t zoom_packet[2] = {0x14, 254};
-    ble_nav_notify_diagnostic_packet(zoom_packet, sizeof(zoom_packet));
-  }
+  nav_zoom_changed();
   ESP_LOGI(TAG, "Nav Recenter -> Follow Mode at Zoom Level 2");
-  if (s_is_initialized && s_current_screen == SCREEN_NAV) {
-    s_route_seg_dirty = true;
-  }
 }
 
 void display_nav_toggle_overview(void) {
@@ -2316,14 +2338,8 @@ void display_nav_toggle_overview(void) {
   } else {
     s_camera_mode = NAV_CAMERA_OVERVIEW;
     s_zoom_level = NAV_ZOOM_LEVEL_5;
-    if (map_frame_active()) {
-    uint8_t zoom_packet[2] = {0x14, s_camera_mode == NAV_CAMERA_OVERVIEW ? 255 : (uint8_t)(18 - (int)s_zoom_level)};
-    ble_nav_notify_diagnostic_packet(zoom_packet, sizeof(zoom_packet));
-  }
-  ESP_LOGI(TAG, "Nav Toggle -> Route Overview");
-    if (s_is_initialized && s_current_screen == SCREEN_NAV) {
-      s_route_seg_dirty = true;
-    }
+    nav_zoom_changed();
+    ESP_LOGI(TAG, "Nav Toggle -> Route Overview");
   }
 }
 

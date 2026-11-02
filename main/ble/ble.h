@@ -50,7 +50,7 @@ void ble_media_command(uint8_t command);
 /**
  * @brief Notify phone of diagnostic payload over BLE 0xFF32
  */
-void ble_nav_notify_diagnostic_packet(const uint8_t *data, uint16_t len);
+bool ble_nav_notify_diagnostic_packet(const uint8_t *data, uint16_t len);
 
 #ifdef __cplusplus
 }

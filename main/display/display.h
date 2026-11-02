@@ -19,6 +19,9 @@ typedef enum {
     TOUCH_GESTURE_SWIPE_LEFT   = 2,  ///< Finger moved right-to-left > SWIPE_MIN_PX
     TOUCH_GESTURE_SWIPE_DOWN   = 3,  ///< Finger moved top-to-bottom > SWIPE_MIN_PX
     TOUCH_GESTURE_SWIPE_UP     = 4,  ///< Finger moved bottom-to-top > SWIPE_MIN_PX
+    TOUCH_GESTURE_DOUBLE_TAP   = 5,
+    TOUCH_GESTURE_ZOOM_IN      = 6,
+    TOUCH_GESTURE_ZOOM_OUT     = 7,
 } touch_gesture_t;
 
 
@@ -41,6 +44,8 @@ typedef struct {
     uint8_t completed_segment_count;
     uint8_t progress_percent;
     bool is_destination_visible;
+    bool camera_projected; // Phone owns zoom/framing; don't scale twice.
+    bool overview;         // First point is the live rider in a fixed viewport.
     uint16_t dest_x;
     uint16_t dest_y;
     route_point_t points[ROUTE_MAX_POINTS];
@@ -167,6 +172,7 @@ void display_set_imu_override_direction(nav_direction_t dir);
 void display_handle_touch_event(int16_t start_x, int16_t start_y,
                                 int16_t end_x,   int16_t end_y,
                                 touch_gesture_t gesture);
+bool display_nav_touch_zoom_allowed(int16_t x,int16_t y);
 
 /** Update real-time clock (called by rtc_time.c) */
 void display_set_time(uint8_t hours, uint8_t minutes);
