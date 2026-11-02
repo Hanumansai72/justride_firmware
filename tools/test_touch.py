@@ -15,6 +15,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--source', type=Path, default=ROOT / 'main' / 'display')
 args = parser.parse_args()
 OUT.mkdir(parents=True, exist_ok=True)
+(OUT / 'sdkconfig.h').write_text('#pragma once\n')
 (OUT / 'driver').mkdir(exist_ok=True)
 
 headers = {

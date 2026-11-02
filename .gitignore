@@ -1,7 +1,15 @@
 build/
+build-*/
+managed_components/
+__pycache__/
+*.pyc
 sdkconfig
 sdkconfig.old
+sdkconfig.*
+!sdkconfig.defaults*
 .vscode/
 .clangd/
 *.bin
 *.elf
+*.map
+*.log

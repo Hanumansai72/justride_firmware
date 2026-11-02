@@ -1,0 +1,24 @@
+menu "JustRide board"
+config JUSTRIDE_ROUND_AMOLED
+    bool "Waveshare ESP32-S3-Touch-AMOLED-1.43"
+    default y
+    depends on IDF_TARGET_ESP32S3
+if JUSTRIDE_ROUND_AMOLED
+choice JR_PANEL_MODEL
+    prompt "AMOLED panel variant"
+    default JR_PANEL_AUTO
+config JR_PANEL_AUTO
+    bool "Detect ID (Waveshare V3 procedure)"
+config JR_PANEL_SH8601
+    bool "Force SH8601 (X offset 0)"
+config JR_PANEL_CO5300
+    bool "Force CO5300 (X offset 6)"
+endchoice
+config JR_TOUCH_SWAP_XY
+    bool "Swap touch X/Y"
+config JR_TOUCH_MIRROR_X
+    bool "Mirror touch X"
+config JR_TOUCH_MIRROR_Y
+    bool "Mirror touch Y"
+endif
+endmenu

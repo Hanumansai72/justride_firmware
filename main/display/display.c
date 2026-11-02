@@ -1,6 +1,7 @@
 #include "mpu6500.h"
 #include "map_frame.h"
 #include "hud_ui.h"
+#include "round_ui.h"
 #include "display.h"
 #include "freertos/queue.h"
 #include "esp_heap_caps.h"
@@ -265,6 +266,17 @@ void display_update_media(const media_state_t *state) {
 }
 
 static void render_music(void) {
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+  {
+  if(s_media_frame && !s_media_dirty)return;
+  tft_set_round_canvas(true);
+  bool active=s_ble_connected && s_media.state>=3 && s_media.state<=5;
+  const char *status=!s_ble_connected?"PHONE DISCONNECTED":active?"":"CONNECT A PLAYER ON PHONE";
+  round_ui_music(s_ble_connected?s_media.title:"",s_ble_connected?s_media.artist:"",
+      status,s_media.state==4,s_media.actions,active);
+  s_media_frame=true;s_media_dirty=false;return;
+  }
+#endif
   if (!s_media_frame) {
     tft_fill_screen(COLOR_BLACK);
     tft_draw_string(14, 12, "MUSIC", COLOR_JUST_GREEN, COLOR_BLACK, 2);
@@ -381,6 +393,7 @@ static void render_pagination(screen_id_t active_id) {
 }
 
 // Helper: Glowing Winding Route Icon (from official brand logo asset)
+#if !CONFIG_JUSTRIDE_ROUND_AMOLED
 static void draw_splash_route_icon(int cx, int cy, int size, uint16_t color) {
   int spacing = size / 2;
   int x1 = cx - spacing;
@@ -489,6 +502,7 @@ static void draw_splash_topographic_lines(void) {
   }
 }
 
+#endif
 void display_show_splash(void) {
   if (!s_is_initialized)
     display_init();
@@ -504,6 +518,17 @@ void display_show_splash(void) {
 
   // Hold background rendering tasks at bay
   s_current_screen = SCREEN_COUNT;
+  tft_set_backlight(0);
+
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+  tft_set_round_canvas(true);
+  round_ui_splash(0);
+  tft_set_backlight(s_brightness_pct);
+  for(unsigned p=5;p<=100;p+=5) {
+    round_ui_splash_progress(p);
+    vTaskDelay(pdMS_TO_TICKS(35));
+  }
+#else
 
   // 1. Clean screen canvas to pure deep black
   tft_fill_screen(COLOR_BLACK);
@@ -567,6 +592,7 @@ void display_show_splash(void) {
     }
     vTaskDelay(pdMS_TO_TICKS(35));
   }
+#endif
 
   vTaskDelay(pdMS_TO_TICKS(180));
 
@@ -636,6 +662,13 @@ static void draw_home_modern_digit(int x, int y, char digit, uint16_t color) {
 }
 
 static void draw_home_screen_clock(void) {
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+  tft_set_round_canvas(true);
+  char date[32]={0};time_get_date_str(date,sizeof(date));
+  round_ui_clock(s_time_hours,s_time_minutes,date[0]?date:"PHONE TIME NOT SET",
+      s_nav.is_navigating?s_nav.remaining_dist_km:0);
+  return;
+#endif
   // Clear central clock and date area cleanly: X: 0..319, Y: 50..220
   tft_fill_rect(0, 50, DISPLAY_WIDTH, 170, COLOR_BLACK);
 
@@ -848,6 +881,12 @@ static void render_notification_banner(void) {
   if (!s_latest_notif.active || s_current_screen == SCREEN_OTA || s_call.state==1) return;
   unsigned elapsed=(unsigned)((esp_timer_get_time()-s_notif_started_us)/1000);
   unsigned remaining=elapsed>=2000?0:2000-elapsed;
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+  if(tft_is_round_canvas()) {
+    round_ui_notification(s_latest_notif.app,s_latest_notif.title,s_latest_notif.message);
+    s_notif_dirty=false;return;
+  }
+#endif
   if (s_notif_dirty) {
     hud_notification(s_latest_notif.app,s_latest_notif.title,s_latest_notif.message,remaining);
     s_notif_dirty=false;
@@ -864,6 +903,19 @@ static void render_notification_banner(void) {
 static void render_route_resume_modal(void) {
   if (!s_show_route_resume_modal)
     return;
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+  if(tft_is_round_canvas()) {
+    tft_fill_round_rect(30,80,260,170,12,COLOR_BLACK);
+    tft_draw_round_rect(30,80,260,170,12,COLOR_JUST_GREEN);
+    hud_text(80,105,"RESUME ROUTE?",16,COLOR_WHITE,COLOR_BLACK,210);
+    hud_text(70,140,"Continue to destination?",12,COLOR_LIGHTGREY,COLOR_BLACK,210);
+    tft_fill_round_rect(35,180,115,40,8,COLOR_JUST_GREEN);
+    tft_draw_round_rect(170,180,115,40,8,COLOR_LIGHTGREY);
+    tft_draw_string_centered(92,195,"CONTINUE",COLOR_BLACK,COLOR_JUST_GREEN,1);
+    tft_draw_string_centered(227,195,"CANCEL",COLOR_WHITE,COLOR_BLACK,1);
+    return;
+  }
+#endif
 
   // Center Modal window
   tft_fill_rect(20, 35, 280, 170, COLOR_BLACK);
@@ -952,6 +1004,27 @@ static void display_nav_render_partial(void) {
   snprintf(model.instruction,sizeof(model.instruction),"%s",instruction);
   for(int i=0;i<2;i++){model.poi_valid[i]=s_pois[i].poi_type==i+1 && s_pois[i].poi_name[0];model.poi_distance[i]=s_pois[i].poi_distance_m;}
   bool first=!s_hud.is_frame_active;
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+  tft_set_round_canvas(true);
+  static uint32_t map_serial,marker_serial;
+  static int last_tilt;
+  int tilt=(int)lroundf(rider_motion_degrees()/2)*2;
+  if(first || s_route_seg_dirty || memcmp(&model,&s_last_hud,sizeof(model)) ||
+      map_serial!=map_frame_paint_serial() || marker_serial!=map_frame_marker_serial() ||
+      tilt!=last_tilt || s_notif_dirty) {
+    round_route_point_t points[ROUTE_MAX_POINTS];
+    for(unsigned i=0;i<s_route_seg.count;i++){points[i].x=s_route_seg.points[i].x;points[i].y=s_route_seg.points[i].y;}
+    round_nav_t view={.nav=model,.points=points,.count=s_route_seg.count,
+        .completed=s_route_seg.completed_segment_count,.tilt=tilt,.zoom_percent=route_zoom_percent(),
+        .overview=s_route_seg.overview};
+    round_ui_navigation(&view);
+    map_serial=map_frame_paint_serial();marker_serial=map_frame_marker_serial();last_tilt=tilt;
+    s_last_hud=model;s_hud.is_frame_active=true;s_route_seg_dirty=false;
+    s_notif_dirty=false;
+    render_notification_banner();render_route_resume_modal();
+  }
+  return;
+#endif
   if(first){tft_fill_screen(HUD_BG);s_map_drawn=false;s_route_seg_dirty=true;}
   map_frame_set_tilt(rider_motion_degrees());
   bool route_painted=s_route_seg_dirty && !map_frame_active();
@@ -1070,6 +1143,7 @@ bool display_finish_image_stream(void) {
 }
 
 void display_show_user_image(void) {
+  tft_set_round_canvas(false);
   if (!s_is_initialized)
     display_init();
   s_current_screen = SCREEN_PICTURE;
@@ -1160,6 +1234,7 @@ static void render_motion_settings(bool force) {
 }
 
 void display_show_settings_screen(void) {
+  tft_set_round_canvas(false);
   if (!s_is_initialized)
     display_init();
   s_current_screen = SCREEN_SETTINGS;
@@ -1293,6 +1368,7 @@ void display_show_settings_screen(void) {
 // SCREEN: DEDICATED BRIGHTNESS SLIDER SCREEN (Accessed via Swipe Down from Top)
 // =============================================================================
 void display_show_brightness_screen(void) {
+  tft_set_round_canvas(false);
   if (!s_is_initialized)
     display_init();
   s_current_screen = SCREEN_BRIGHTNESS;
@@ -1355,6 +1431,7 @@ void display_show_brightness_screen(void) {
 // SCREEN 5: OTA UPDATING SCREEN (Preserved)
 // =============================================================================
 void display_show_ota_screen(uint8_t progress_pct) {
+  tft_set_round_canvas(false);
   if (!s_is_initialized)
     display_init();
   if (progress_pct > 100)
@@ -1461,6 +1538,7 @@ void display_set_screen(uint8_t screen_id) {
   s_screen_refresh = false;
   s_media_frame = false;
   s_current_screen = (screen_id_t)screen_id;
+  tft_set_round_canvas(false);
   s_hud.is_frame_active = false; // Reset HUD static frame flag so entering
                                  // SCREEN_NAV initialises cleanly
   s_hud.destination_reached = false;
@@ -1565,7 +1643,11 @@ bool display_nav_touch_zoom_allowed(int16_t x,int16_t y) {
   // Read-only hint for the touch FSM; the UI-locked handler rechecks it.
   return s_current_screen==SCREEN_NAV && s_nav.is_navigating &&
       s_call.state!=1 && !s_show_route_resume_modal &&
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+      x>=50 && x<230 && y>=65 && y<235;
+#else
       x>=104 && x<284 && y>=40 && y<160;
+#endif
 }
 void display_handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x, int16_t end_y, touch_gesture_t gesture) {
   if (!s_display_mutex) return;
@@ -1583,6 +1665,15 @@ static void handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x,
   }
 
   if(s_call.state==1) {
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    if(gesture==TOUCH_GESTURE_TAP && s_ble_connected && start_y>=201 && start_y<=269) {
+      uint8_t action=start_x>=77 && start_x<=145?2:start_x>=175 && start_x<=243?1:0;
+      if(action && (s_call.actions & (1<<(action-1)))) {
+        uint8_t packet[2]={0x1C,action};ble_nav_notify_diagnostic_packet(packet,sizeof(packet));
+      }
+    }
+    return;
+#endif
     if(gesture==TOUCH_GESTURE_TAP && s_ble_connected && start_y>=178 && start_y<=221) {
       uint8_t action=start_x>=18 && start_x<=151?1:start_x>=169 && start_x<=302?2:0;
       if(action && (s_call.actions & (1<<(action-1)))) {
@@ -1662,8 +1753,9 @@ static void handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x,
 
     // N: Tap on active Notification Banner (Y: 30..90, X: 10..310) immediately
     // dismisses it
-    if (s_latest_notif.active && ty >= 4 && ty <= 31 && tx >= 100 &&
-        tx <= 235) {
+    if (s_latest_notif.active &&
+        (tft_is_round_canvas() ? (ty>=35 && ty<=94 && tx>=55 && tx<=265) :
+        (ty >= 4 && ty <= 31 && tx >= 100 && tx <= 235))) {
       ESP_LOGI(TAG, "Touch: Notification Banner tapped -> Dismiss");
       display_dismiss_notification();
       return;
@@ -1673,6 +1765,7 @@ static void handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x,
 
     // Route Resume Modal
     if (s_show_route_resume_modal) {
+      if(tft_is_round_canvas())ty-=50;
       // CONTINUE button: X:35..150, Y:130..170
       if (tx >= 35 && tx <= 150 && ty >= 130 && ty <= 170) {
         ESP_LOGI(TAG, "Touch: Resume Route [CONTINUE] tapped");
@@ -1702,6 +1795,27 @@ static void handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x,
     }
 
     if (s_current_screen == SCREEN_MUSIC) {
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+      {
+      if(!s_ble_connected)return;
+      uint8_t command=0,action=0;
+      if(s_media.state<3 || s_media.state>5) {
+        if(ty>=190 && ty<=263)command=s_media.state==1?8:7;
+      } else if(ty>=190 && ty<=263) {
+        if(tx>=48 && tx<=112){command=4;action=8;}
+        else if(tx>=125 && tx<=195){command=s_media.state==4?2:1;action=command;}
+        else if(tx>=208 && tx<=272){command=3;action=4;}
+      } else if(ty>=268 && ty<=310) {
+        if(tx>=92 && tx<=144){command=6;action=16;}
+        else if(tx>=176 && tx<=228){command=5;action=16;}
+      }
+      int64_t now=esp_timer_get_time();
+      if(command && (!action || (s_media.actions&action)) && now-s_last_media_command_us>=250000) {
+        s_last_media_command_us=now;ble_media_command(command);
+      }
+      return;
+      }
+#endif
       ESP_LOGI(TAG, "MEDIA TAP x=%d y=%d connected=%d state=%u actions=0x%02x",
                tx, ty, s_ble_connected, s_media.state, s_media.actions);
       if (!s_ble_connected) return;
@@ -1736,6 +1850,11 @@ static void handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x,
 
     // Compass returns the actual map camera to the rider; trip card fits route.
     if(s_current_screen==SCREEN_NAV) {
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+      if(tx>=232 && tx<=292 && ty>=50 && ty<=110)display_nav_recenter();
+      if(tx>=50 && tx<=125 && ty>=45 && ty<=100)display_nav_toggle_overview();
+      return;
+#endif
       if(tx>=288 && ty>=142 && ty<=171){display_nav_recenter();return;}
       if(tx>=245 && ty<=38){display_nav_toggle_overview();return;}
       return;
@@ -2045,7 +2164,15 @@ static void nav_render_task(void *pvParam) {
         else s_zoom_due_us=esp_timer_get_time()+500000;
       }
       if(s_call.state==1 && s_current_screen!=SCREEN_OTA) {
-        if(!s_call_painted){hud_call(s_call.caller,s_call.actions,s_ble_connected);s_call_painted=true;}
+        if(!s_call_painted){
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+          tft_set_round_canvas(true);
+          round_ui_call(s_call.caller,s_call.actions,s_ble_connected);
+#else
+          hud_call(s_call.caller,s_call.actions,s_ble_connected);
+#endif
+          s_call_painted=true;
+        }
       } else {
       if(restore_call && s_current_screen!=SCREEN_OTA){s_screen_refresh=true;display_set_screen(s_current_screen);}
       if (s_current_screen == SCREEN_NAV) display_nav_render_partial();
@@ -2425,6 +2552,10 @@ void display_dismiss_notification(void) {
       display_show_home_screen();
       break;
     case SCREEN_NAV:
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+      s_route_seg_dirty=true;
+      break;
+#endif
       if(map_frame_active()) map_frame_restore_region(100,4,135,27);
       else s_route_seg_dirty=true;
       break;

@@ -18,6 +18,10 @@
  */
 
 #include "mpu6500.h"
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+#include "waveshare143.h"
+#include "board_decode.h"
+#endif
 #include "ble.h"
 #include "display.h"   // display_set_imu_override_direction(), display_set_imu_heading()
 
@@ -33,12 +37,20 @@
 #include <stdint.h>
 #include <string.h>
 
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+static const char *TAG = "QMI8658";
+#else
 static const char *TAG = "MPU6500";
+#endif
 
 // =============================================================================
 // SCALE FACTORS & CONSTANTS
 // =============================================================================
-#define GYRO_SENSITIVITY_DPS    65.5f       // LSB per deg/s at +/-500 deg/s range
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+#define GYRO_SENSITIVITY_DPS    64.0f       // QMI8658 +/-512 dps
+#else
+#define GYRO_SENSITIVITY_DPS    65.5f       // MPU6500 +/-500 dps
+#endif
 #define ACCEL_SENSITIVITY_LSB_G 16384.0f    // LSB per 1g at +/-2g range
 
 #define IMU_TASK_PERIOD_MS      20          // 50 Hz sampling (20ms period)
@@ -68,7 +80,9 @@ static float s_base_ax           = 0.0f;
 static float s_base_ay           = 0.0f;
 static float s_base_az           = 0.0f;
 static bool  s_is_vertical_mount = true;
+#if !CONFIG_JUSTRIDE_ROUND_AMOLED
 static uint8_t s_mpu_addr        = MPU6500_I2C_ADDR;
+#endif
 static volatile bool s_calibration_complete = false;
 static volatile bool s_sensor_available, s_calibration_requested, s_calibrating, s_read_error;
 static TaskHandle_t s_imu_task;
@@ -183,6 +197,9 @@ static bool accel_sample_valid(int16_t ax, int16_t ay, int16_t az) {
 // =============================================================================
 
 static esp_err_t i2c_write_reg(uint8_t reg, uint8_t val) {
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    return waveshare143_write(0x6b,reg,val);
+#else
     uint8_t buf[2] = {reg, val};
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
@@ -192,9 +209,13 @@ static esp_err_t i2c_write_reg(uint8_t reg, uint8_t val) {
     esp_err_t ret = i2c_master_cmd_begin(MPU6500_I2C_PORT, cmd, pdMS_TO_TICKS(50));
     i2c_cmd_link_delete(cmd);
     return ret;
+#endif
 }
 
 static esp_err_t i2c_read_reg(uint8_t reg, uint8_t *data, size_t len) {
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    return waveshare143_read(0x6b,reg,data,len);
+#else
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (s_mpu_addr << 1) | I2C_MASTER_WRITE, true);
@@ -209,6 +230,7 @@ static esp_err_t i2c_read_reg(uint8_t reg, uint8_t *data, size_t len) {
     esp_err_t ret = i2c_master_cmd_begin(MPU6500_I2C_PORT, cmd, pdMS_TO_TICKS(50));
     i2c_cmd_link_delete(cmd);
     return ret;
+#endif
 }
 
 // =============================================================================
@@ -217,19 +239,33 @@ static esp_err_t i2c_read_reg(uint8_t reg, uint8_t *data, size_t len) {
 
 esp_err_t mpu6500_read_accel(int16_t *ax, int16_t *ay, int16_t *az) {
     uint8_t buf[6];
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    esp_err_t ret=i2c_read_reg(0x35,buf,6);
+    if(ret!=ESP_OK)return ret;
+    if(ax)*ax=qmi8658_s16(buf);
+    if(ay)*ay=qmi8658_s16(buf+2);
+    if(az)*az=qmi8658_s16(buf+4);
+#else
     esp_err_t ret = i2c_read_reg(MPU6500_REG_ACCEL_XOUT_H, buf, 6);
     if (ret != ESP_OK) return ret;
     if (ax) *ax = (int16_t)((buf[0] << 8) | buf[1]);
     if (ay) *ay = (int16_t)((buf[2] << 8) | buf[3]);
     if (az) *az = (int16_t)((buf[4] << 8) | buf[5]);
+#endif
     return ESP_OK;
 }
 
 esp_err_t mpu6500_read_gyro_z(int16_t *gz_raw) {
     uint8_t buf[2];
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    esp_err_t ret=i2c_read_reg(0x3f,buf,2);
+    if(ret!=ESP_OK)return ret;
+    if(gz_raw)*gz_raw=qmi8658_s16(buf);
+#else
     esp_err_t ret = i2c_read_reg(MPU6500_REG_GYRO_XOUT_H + 4, buf, 2);
     if (ret != ESP_OK) return ret;
     if (gz_raw) *gz_raw = (int16_t)((buf[0] << 8) | buf[1]);
+#endif
     return ESP_OK;
 }
 
@@ -272,6 +308,25 @@ void mpu6500_reset_heading(void) {
 esp_err_t mpu6500_init(void) {
     s_sensor_available = false;
     s_calibration_complete = false;
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    esp_err_t ret=waveshare143_i2c_init();
+    if(ret!=ESP_OK)return ret;
+    uint8_t who=0;
+    ret=i2c_read_reg(0,&who,1);
+    if(ret!=ESP_OK || who!=0x05)return ret!=ESP_OK?ret:ESP_ERR_INVALID_RESPONSE;
+    // Vendor QMI8658: auto increment, +/-2g, +/-512dps, 125Hz.
+    const uint8_t setup[][2]={{8,0},{2,0x60},{3,0x06},{4,0x56},{6,0x11},{8,3}};
+    for(unsigned i=0;i<sizeof(setup)/sizeof(setup[0]);i++) {
+        ret=i2c_write_reg(setup[i][0],setup[i][1]);if(ret!=ESP_OK)return ret;
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+    int16_t ax,ay,az;
+    ret=mpu6500_read_accel(&ax,&ay,&az);
+    if(ret!=ESP_OK || !accel_sample_valid(ax,ay,az))return ret!=ESP_OK?ret:ESP_ERR_INVALID_RESPONSE;
+    s_sensor_available=true;s_gyro_available=true;
+    ESP_LOGI(TAG,"QMI8658 ready: 0x6B SDA=47 SCL=48; existing motion filter/calibration");
+    return ESP_OK;
+#else
     ESP_LOGI(TAG, "Initialising MPU6500 (I2C SDA=GPIO%d SCL=GPIO%d addr=0x%02X)",
              MPU6500_I2C_SDA_PIN, MPU6500_I2C_SCL_PIN, MPU6500_I2C_ADDR);
 
@@ -564,6 +619,7 @@ esp_err_t mpu6500_init(void) {
 
     ESP_LOGI(TAG, "MPU6500 init complete.");
     return ESP_OK;
+#endif
 }
 
 // =============================================================================

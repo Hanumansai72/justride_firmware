@@ -182,7 +182,11 @@ void app_main(void)
     ESP_LOGI(TAG, "Boot reset reason: %d", (int)esp_reset_reason());
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "       JustRide Motorcycle Device       ");
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    ESP_LOGI(TAG, "  ESP32-S3 1.43 AMOLED / BLE / Dual OTA ");
+#else
     ESP_LOGI(TAG, "     2.8\" TFT SPI HUD & Dual OTA       ");
+#endif
     ESP_LOGI(TAG, "========================================");
 
     // --------------------------------------------------
@@ -235,7 +239,11 @@ void app_main(void)
     BaseType_t touch_created = xTaskCreate(touch_task, "touch_task", 3072, NULL, 5, NULL);
     configASSERT(touch_created == pdPASS);
 
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    ESP_LOGI(TAG,"1.43-inch Waveshare AMOLED running. NimBLE logs its BLE address.");
+#else
     ESP_LOGI(TAG, "All subsystems running. 2.8\" HUD operational.");
+#endif
 
     // Keep rollback available if the new image fails during initial startup.
     vTaskDelay(pdMS_TO_TICKS(10000));

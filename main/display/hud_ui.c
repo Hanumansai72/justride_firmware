@@ -24,6 +24,8 @@ static const hud_font_t *font(unsigned size) {
     return &hud_font_22;
   case 36:
     return &hud_font_36;
+  case 52:
+    return &hud_font_52;
   default:
     return &hud_font_28;
   }
@@ -49,7 +51,7 @@ void hud_text(int x, int y, const char *s, unsigned size, uint16_t fg,
               uint16_t bg, int max_width) {
   // Fixed row scratch: no framebuffer, heap allocation, or per-pixel SPI
   // writes.
-  static uint8_t row[64];
+  static uint8_t row[128];
   int end = x + max_width;
   const hud_font_t *f = font(size);
   for (; *s; s++) {
@@ -77,6 +79,21 @@ void hud_text(int x, int y, const char *s, unsigned size, uint16_t fg,
 static void centered(int cx, int y, const char *s, unsigned size, uint16_t fg,
                      uint16_t bg) {
   hud_text(cx - hud_text_width(s, size) / 2, y, s, size, fg, bg, 320);
+}
+void hud_text_overlay(int x,int y,const char *s,unsigned size,uint16_t fg,int max_width) {
+  int end=x+max_width;
+  const hud_font_t *f=font(size);
+  for(;*s;s++) {
+    unsigned c=(unsigned char)*s;if(c<32 || c>126)c='?';
+    const hud_glyph_t *g=&f->glyphs[c-32];
+    if(x+g->advance>end)break;
+    for(unsigned yy=0;yy<g->height;yy++)for(unsigned xx=0;xx<g->width;xx++) {
+      unsigned i=yy*g->width+xx;
+      uint8_t p=f->pixels[g->offset+i/2];
+      tft_blend_pixel(x+g->left+xx,y+g->top+yy,fg,(i&1)?p&15:p>>4);
+    }
+    x+=g->advance;
+  }
 }
 static void card(int x, int y, int w, int h, int radius, uint16_t border) {
   tft_fill_round_rect(x, y, w, h, radius, HUD_PANEL);
