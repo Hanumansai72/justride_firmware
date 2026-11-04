@@ -2,7 +2,8 @@
 
 This review traces the companion app's provider mapping, maneuver state, BLE
 encoding and the round firmware renderer. These are current code limitations,
-not newly invented requirements. No additional navigation features were added.
+not newly invented requirements. The rerouting status fix and medium left-side
+alert layout are described in WAVESHARE_143.md; the limitations below remain.
 
 | Confirmed gap | Code evidence and rider-visible consequence |
 |---|---|

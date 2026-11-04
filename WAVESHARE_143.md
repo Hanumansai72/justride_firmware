@@ -18,10 +18,11 @@ coordinates are mapped through the same transform.
 
 ### Riding experience
 
-- Within 100 m of a left/right maneuver, three large **green chevrons** use the
-  supplied reference silhouette, mirrored for right. They blink 500 ms on / 500
-  ms off. The smaller direction arrow and distance remain visible during blink
-  off. Completed maneuvers, overview, paused or unreliable guidance do not blink.
+- Within 100 m of a left/right maneuver, three medium **green chevrons on the left**
+  use the supplied reference silhouette. Right-turn chevrons mirror inside that
+  same left-side area. They blink 500 ms on / 500 ms off. The route and white rider
+  pointer remain visible in both phases; no large black rectangle covers the map.
+  Completed maneuvers, overview, paused or unreliable guidance do not blink.
 - The lower guidance panel includes arrival clock time (24-hour `ETA HH:MM`) and
   total remaining kilometres from the phone's existing route telemetry. A valid
   phone-synchronized clock is required for ETA; unavailable values show dashes.
@@ -33,6 +34,15 @@ coordinates are mapped through the same transform.
   This does **not** refresh an old GPS fix: fixes older than ten seconds or with
   accuracy worse than 50 m produce `GPS WEAK` on the display and suppress turn
   alerts. The existing longer phone GPS recovery loop continues in the background.
+- Confirmed off-route detection shows **OFF ROUTE / RECALCULATING ROUTE** on the
+  device and an off-route banner on the phone. Failed/empty route responses retain
+  the warning as **RETRYING ROUTE**, with the old route dimmed and old turn guidance
+  suppressed. Requests back off from 20 to 80 seconds after failures and retry on
+  a fresh accurate GPS update. Initial confirmation still requires movement,
+  accurate fixes, three outside-corridor samples and four seconds of deviation.
+  Once confirmed, retry can continue while stationary. Between requests, accurate
+  moving fixes back inside the original corridor clear the warning without another request. A new
+  route resets guidance and geometry; a response after Stop is ignored.
 - `LOW BATTERY` appears on navigation at an estimated level ≤15%, only when supply
   measurements infer battery power. Five consecutive one-second low samples
   trigger one notification; it rearms after USB power or an estimate ≥20%. Missing
@@ -50,6 +60,7 @@ coordinates are mapped through the same transform.
 [Left turn blink, native 466×466](docs/previews/turn-left-blink-466.gif) ·
 [Right turn blink, native 466×466](docs/previews/turn-right-blink-466.gif) ·
 [Arrival, native 466×466](docs/previews/arrival-native.png).
+![Medium left alert and rerouting states — SAMPLE telemetry](docs/previews/left-alert-rerouting.png)
 The preview's outside margin is decorative; the actual panel is 466×466.
 The firmware retains its existing 320×320 logical drawing canvas and maps it
 through the production panel transform. No photograph or hardware timing is claimed.

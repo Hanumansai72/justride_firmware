@@ -1013,7 +1013,7 @@ static void display_nav_render_partial(void) {
     if(!s_ble_connected)instruction="PHONE OFFLINE";
     else if(!s_phone_state_ready)instruction="SYNCING";
     else if(!s_nav.gps_available)instruction="GPS LOST";
-    else if(s_nav.rerouting)instruction="REROUTING";
+    else if(s_nav.rerouting)instruction=s_nav.current_street;
   }
   snprintf(model.instruction,sizeof(model.instruction),"%s",instruction);
   for(int i=0;i<2;i++){model.poi_valid[i]=s_pois[i].poi_type==i+1 && s_pois[i].poi_name[0];model.poi_distance[i]=s_pois[i].poi_distance_m;}

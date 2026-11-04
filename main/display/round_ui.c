@@ -128,10 +128,13 @@ static void turn_arrow(uint8_t direction) {
 static void turn_chevrons(int side) {
     // Same six-point silhouette as the supplied reference, mirrored for right.
     for(int i=0;i<3;i++) {
-        int x=96+i*36,y=116;
-        int px[]={x+35,x+58,x+23,x+58,x+35,x};
-        int py[]={y,y,y+42,y+84,y+84,y+42};
-        if(side>0)for(int j=0;j<6;j++)px[j]=320-px[j];
+        int px[]={35,58,23,58,35,0};
+        int py[]={0,0,42,84,84,42};
+        for(int j=0;j<6;j++) {
+            if(side>0)px[j]=58-px[j];
+            px[j]=32+i*21+lroundf(px[j]*0.58f);
+            py[j]=127+lroundf(py[j]*0.58f);
+        }
         uint16_t c=i==1?GREEN:shade(GREEN,0.70f);
         tft_fill_triangle(px[0],py[0],px[1],py[1],px[2],py[2],c);
         tft_fill_triangle(px[0],py[0],px[2],py[2],px[5],py[5],c);
@@ -159,11 +162,8 @@ static void draw_nav(void *context) {
     if(v->count<2)text(160,125,"WAITING FOR ROUTE",12,MUTED);
     int rider_x=RIDER_X,rider_y=RIDER_Y;
     if(v->overview && v->count){point_t p=route_point(v,0);rider_x=lroundf(p.x);rider_y=lroundf(p.y);}
-    if(live && !alert)arrow(rider_x,rider_y,v->overview?m->heading:v->tilt);
-    if(alert) {
-        tft_fill_rect(45,111,230,100,BLACK);
-        if(v->blink_on)turn_chevrons(ride_turn_side(m->direction));
-    }
+    if(live)arrow(rider_x,rider_y,v->overview?m->heading:v->tilt);
+    if(alert && v->blink_on)turn_chevrons(ride_turn_side(m->direction));
     char value[24];
     if(m->speed_valid && live)snprintf(value,sizeof(value),"%u",m->speed);
     else strcpy(value,"--");
@@ -191,10 +191,13 @@ static void draw_nav(void *context) {
     if(live && v->trip_valid)snprintf(value,sizeof(value),"ETA %s  %.1f km",v->arrival_time[0]?v->arrival_time:"--:--",m->remaining_km);
     else strcpy(value,"ETA --:--   -- km");
     text(160,289,value,10,MUTED);
-    static const char *states[]={"","RECONNECTING","SYNCING ROUTE","GPS WEAK","REROUTING","PAUSED","WAITING FOR PHONE"};
+    static const char *states[]={"","RECONNECTING","SYNCING ROUTE","GPS WEAK","OFF ROUTE","PAUSED","WAITING FOR PHONE"};
     if(!live) {
         text(160,24,states[v->recovery<=RIDE_STALE?v->recovery:RIDE_STALE],12,GREEN);
-        text(160,100,"LAST ROUTE - DATA STALE",10,MUTED);
+        const char *status=v->recovery==RIDE_REROUTING
+            ? (strstr(m->instruction,"retrying")?"RETRYING ROUTE":"RECALCULATING ROUTE")
+            : "LAST ROUTE - DATA STALE";
+        text(160,100,status,10,MUTED);
     } else if(v->battery_low) {
         snprintf(value,sizeof(value),"LOW BATTERY ~%u%%",v->battery_percent);
         text(160,24,value,10,GREEN);

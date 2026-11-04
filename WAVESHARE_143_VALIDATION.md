@@ -4,8 +4,8 @@ Software verification passed before pushing this branch.
 
 | Check | Result |
 |---|---|
-| ESP-IDF 5.5.5 / ESP32-S3 build | Pass; application 822,016 bytes, 54% OTA-slot space free |
-| ESP-IDF 5.5.5 / original ESP32 2.8-inch build | Pass; application 769,312 bytes, 57% OTA-slot space free |
+| ESP-IDF 5.5.5 / ESP32-S3 build | Pass; application 822,256 bytes, 54% OTA-slot space free |
+| ESP-IDF 5.5.5 / original ESP32 2.8-inch build | Pass; application 769,328 bytes, 57% OTA-slot space free |
 | Actual QSPI transport with mocked SPI/GPIO | Pass for SH8601 and CO5300 IDs/offsets, fragmented writes, even-row DMA and unchanged-row suppression |
 | Actual FT3168 driver with mocked I2C | Pass for contact mapping, release and read failure |
 | Round C renderer and geometry | Pass; all preview screens generated from the production functions |
@@ -21,6 +21,8 @@ Software verification passed before pushing this branch.
 | Both panel standby transports | Pass with mocked I/O; 0x28/0x29, duplicate suppression, no asleep pixel writes, full frame/brightness restore |
 | Raw-contact wake handling | Pass; first held touch is consumed, one isolated failed/release sample is tolerated, next separate tap works, outside-pane FT3168 contact is retained |
 | App maneuver gap diagnostics | Four reproductions passed, confirming current ramp/U-turn/roundabout/parallel-road limitations; see NAVIGATION_GAPS.md |
+| Rerouting pipeline | Three actual NavigationService tests with mocked GPS/routes passed: failed request retains warning and backs off before success, returning to the old route clears the warning, late response after Stop is ignored |
+| App regression run | 41 tests passed, including the four existing gap diagnostics; three rerouting integration tests passed separately |
 
 The companion APK source is in the separate MobileApp checkout; no private app
 source is published in this firmware repository. Its power card was widget-tested
@@ -28,8 +30,9 @@ for live battery/USB changes and disconnect clearing. This is mocked telemetry,
 not a physical BLE session. The APK includes a separate S3 firmware asset and
 refuses OTA images for the wrong ESP chip.
 
-The round preview fixture checks that blink off clears only the chevron rectangle:
-speed, maneuver distance, trip footer and other pixels stay unchanged. Both
+The round preview fixture checks that the medium left overlay changes only its
+small bounds, and that blink off matches a normal frame exactly, preserving the
+route, pointer, speed, maneuver distance and trip footer. Both
 directions are captured on/off, with 466×466 two-frame GIFs (500 ms per frame).
 Recovery tests cover five-second packet expiry, disconnect, sync, weak GPS,
 rerouting, pause and automatic return to live state. Turn alerts are suppressed

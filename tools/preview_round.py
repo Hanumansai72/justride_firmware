@@ -129,16 +129,24 @@ __declspec(dllexport) int render_round(void) {
     assert(memcmp(previous,capture_pixels(),sizeof previous));
     for(int yy=0;yy<320;yy++)for(int xx=0;xx<320;xx++) {
         unsigned at=(yy*320+xx)*2;
-        if(xx>=45 && xx<275 && yy>=111 && yy<211)
-            assert(capture_pixels()[at]==0 && capture_pixels()[at+1]==0);
-        else assert(previous[at]==capture_pixels()[at] && previous[at+1]==capture_pixels()[at+1]);
+        if(xx<32 || xx>=109 || yy<127 || yy>=177)
+            assert(previous[at]==capture_pixels()[at] && previous[at+1]==capture_pixels()[at+1]);
     }
+    memcpy(previous,capture_pixels(),sizeof previous);
+    v.maneuver_state=5;round_ui_navigation(&v);
+    assert(!memcmp(previous,capture_pixels(),sizeof previous)); // Blink off preserves the full map and pointer.
+    v.maneuver_state=3;
     v.nav.direction=5;v.blink_on=true;
     round_ui_navigation(&v);capture_save("turn-right-on.rgb565");
     v.blink_on=false;round_ui_navigation(&v);capture_save("turn-right-off.rgb565");
     v.recovery=RIDE_STALE;round_ui_navigation(&v);capture_save("stale-data.rgb565");
     v.recovery=RIDE_RECONNECTING;round_ui_navigation(&v);capture_save("reconnecting.rgb565");
     v.recovery=RIDE_GPS_WEAK;round_ui_navigation(&v);capture_save("gps-weak.rgb565");
+    v.recovery=RIDE_REROUTING;strcpy(v.nav.instruction,"Off route - rerouting");
+    round_ui_navigation(&v);capture_save("off-route-recalculating.rgb565");
+    strcpy(v.nav.instruction,"Off route - retrying");
+    round_ui_navigation(&v);capture_save("off-route-retrying.rgb565");
+    strcpy(v.nav.instruction,"");
     v.recovery=RIDE_LIVE;v.nav.distance_m=300;v.battery_low=true;v.battery_percent=12;
     round_ui_navigation(&v);capture_save("low-battery.rgb565");v.battery_low=false;
     round_ui_arrival();capture_save("arrival.rgb565");
@@ -205,6 +213,11 @@ for i,(name,label) in enumerate([
     ux.paste(Image.open(OUT/(name+'.png')),(x,y+35))
 d.text((20,1630),'Production renderer / SAMPLE data. Each round display is 466 x 466 pixels. Hardware test still required.',fill='white')
 ux.save(OUT/'ride-experience.png')
+recovery=Image.new('RGB',(1530,570),'#111719');d=ImageDraw.Draw(recovery)
+for i,(name,label) in enumerate([('turn-left-on','MEDIUM LEFT-SIDE TURN ALERT / MAP VISIBLE'),('off-route-recalculating','CONFIRMED OFF ROUTE / RECALCULATING'),('off-route-retrying','REQUEST FAILED / ALERT RETAINED')]):
+    d.text((i*510+15,12),label,fill='white');recovery.paste(Image.open(OUT/(name+'.png')),(i*510,35))
+d.text((15,550),'Production C renderer / SAMPLE telemetry. Physical board and live navigation still need testing.',fill='white')
+recovery.save(OUT/'left-alert-rerouting.png')
 guide=Image.new('RGB',(1020,570),'#111719');d=ImageDraw.Draw(guide)
 for i,(name,label) in enumerate([('u-turn','U-TURN / CURRENT IMPLEMENTATION'),('flyover-current','FLYOVER REQUEST / CURRENT GENERIC EXIT FALLBACK')]):
     d.text((i*510+15,12),label,fill='white')

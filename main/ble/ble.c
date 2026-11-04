@@ -928,7 +928,7 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
         if(opcode==NAV_OP_PAUSE || (flags&(1<<4))) {
             strncpy(nav_data.current_street,"PAUSED",sizeof(nav_data.current_street)-1);
         } else if (opcode == NAV_OP_REROUTE || is_reroute) {
-            strncpy(nav_data.current_street, "REROUTING...", sizeof(nav_data.current_street) - 1);
+            strncpy(nav_data.current_street, street_buf[0]?street_buf:"REROUTING...", sizeof(nav_data.current_street) - 1);
         } else if (opcode == NAV_OP_ARRIVED) {
             strncpy(nav_data.current_street, "DESTINATION REACHED", sizeof(nav_data.current_street) - 1);
         } else {
