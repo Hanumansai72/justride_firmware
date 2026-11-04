@@ -1,5 +1,6 @@
 #pragma once
 #include "hud_ui.h"
+#include "ride_ux.h"
 typedef struct { uint16_t x,y; } round_route_point_t;
 typedef struct {
     hud_model_t nav;
@@ -8,8 +9,12 @@ typedef struct {
     bool overview;
     float tilt;
     int zoom_percent;
+    uint8_t recovery, maneuver_state, battery_percent;
+    bool blink_on, battery_low, trip_valid;
+    char arrival_time[8];
 } round_nav_t;
 void round_ui_navigation(const round_nav_t *view);
+void round_ui_arrival(void);
 void round_ui_splash(unsigned progress);
 void round_ui_splash_progress(unsigned progress);
 void round_ui_clock(uint8_t hours,uint8_t minutes,const char *date,float remaining_km);

@@ -8,7 +8,7 @@ OUT=ROOT/'build/board-tests';INC=OUT/'include'
 (INC/'driver').mkdir(parents=True,exist_ok=True)
 (INC/'freertos').mkdir(exist_ok=True)
 headers={
-'stdint.h':'typedef unsigned char uint8_t;typedef signed char int8_t;typedef unsigned short uint16_t;typedef short int16_t;typedef unsigned int uint32_t;typedef int int32_t;typedef unsigned long long uint64_t;',
+'stdint.h':'typedef unsigned char uint8_t;typedef signed char int8_t;typedef unsigned short uint16_t;typedef short int16_t;typedef unsigned int uint32_t;typedef int int32_t;typedef unsigned long long uint64_t;typedef long long int64_t;',
 'stddef.h':'typedef unsigned long long size_t;\n#define NULL ((void*)0)',
 'stdbool.h':'#define bool _Bool\n#define true 1\n#define false 0',
 'string.h':'#include <stddef.h>\nvoid *memcpy(void*,const void*,size_t);void *memset(void*,int,size_t);int memcmp(const void*,const void*,size_t);',
@@ -63,6 +63,7 @@ fixture=r'''
 #include "waveshare143.h"
 #include "power_math.h"
 #include "motion_math.h"
+#include "ride_ux.h"
 int _fltused;
 #include "round_panel.c"
 #include "touch_ft3168.c"
@@ -153,6 +154,39 @@ __declspec(dllexport) int run_board_checks(void){
  assert(power_percent(3200)==0 && power_percent(4200)==100);
  for(int mv=3001;mv<=4300;mv++)assert(power_percent(mv)>=power_percent(mv-1));
  assert(power_measurement(1250,1020,0).rail_mv==3825);
+ power_warning_t warning={0};
+ p=(device_power_t){.valid=true,.source=1,.percent=15};
+ for(int i=0;i<4;i++)assert(!power_warning_update(&warning,p));
+ assert(power_warning_update(&warning,p));
+ for(int i=0;i<20;i++)assert(!power_warning_update(&warning,p));
+ p.percent=18;assert(!power_warning_update(&warning,p));
+ p.percent=15;assert(!power_warning_update(&warning,p)); // Hysteresis prevents repeated warnings.
+ p.source=2;assert(!power_warning_update(&warning,p)); // USB rearms, never warns.
+ p.source=1;
+ for(int i=0;i<4;i++)assert(!power_warning_update(&warning,p));
+ assert(power_warning_update(&warning,p));
+ warning=(power_warning_t){0};
+ for(int i=0;i<4;i++)assert(!power_warning_update(&warning,p));
+ p.valid=false;assert(!power_warning_update(&warning,p));
+ p.valid=true;assert(!power_warning_update(&warning,p)); // A failed ADC breaks the stable window.
+ assert(ride_recovery(false,true,true,false,false,0)==RIDE_RECONNECTING);
+ assert(ride_recovery(true,false,true,false,false,0)==RIDE_SYNCING);
+ assert(ride_recovery(true,true,false,false,false,0)==RIDE_GPS_WEAK);
+ assert(ride_recovery(true,true,true,true,false,0)==RIDE_REROUTING);
+ assert(ride_recovery(true,true,true,false,true,0)==RIDE_PAUSED);
+ assert(ride_recovery(true,true,true,false,false,4999999)==RIDE_LIVE);
+ assert(ride_recovery(true,true,true,false,false,5000000)==RIDE_STALE);
+ assert(ride_recovery(true,true,true,false,false,0)==RIDE_LIVE); // A fresh packet recovers without a tap.
+ for(int direction=0;direction<=13;direction++) {
+   bool turn=direction>=2 && direction<=7;
+   assert(ride_turn_alert(direction,3,100,RIDE_LIVE)==turn);
+   assert(!ride_turn_alert(direction,3,101,RIDE_LIVE));
+   assert(!ride_turn_alert(direction,5,10,RIDE_LIVE));
+   for(int state=RIDE_RECONNECTING;state<=RIDE_STALE;state++)
+     assert(!ride_turn_alert(direction,4,10,state));
+ }
+ assert(ride_turn_side(4)==-1 && ride_turn_side(5)==1);
+ assert(ride_blink_on(0) && ride_blink_on(499999) && !ride_blink_on(500000) && ride_blink_on(1000000));
  // Gravity projection supports flat and upright mounting and rejects pitch-only rotation.
  int16_t gyro[3]={0,0,640};
  assert(motion_turn_raw(gyro,0,0,16384)==640);

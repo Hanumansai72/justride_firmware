@@ -26,7 +26,7 @@ typedef struct {point_t a,b;bool past;} path_segment_t;
 // frame, not once per strip; keep allocations out of the navigation loop.
 static path_segment_t path[15];
 static unsigned path_count;
-static const int RIDER_X=155,RIDER_Y=211;
+static const int RIDER_X=155,RIDER_Y=193;
 static float maxf(float a,float b){return a>b?a:b;}
 static int mini(int a,int b){return a<b?a:b;}
 static int maxi(int a,int b){return a>b?a:b;}
@@ -115,15 +115,29 @@ static void disk(int cx,int cy,int radius,uint16_t color) {
 }
 static void turn_arrow(uint8_t direction) {
     if(direction!=4 && direction!=5) {
-        tft_draw_turn_arrow(82,258,37,(nav_direction_t)direction,WHITE);return;
+        tft_draw_turn_arrow(82,246,37,(nav_direction_t)direction,GREEN);return;
     }
     float sign=direction==5?1:-1;
-    point_t a={79,277},b={79,258},c={83,250},d={99,250};
+    point_t a={79,265},b={79,246},c={83,238},d={99,238};
     a.x=87+(a.x-87)*sign;b.x=87+(b.x-87)*sign;
     c.x=87+(c.x-87)*sign;d.x=87+(d.x-87)*sign;
-    stroke(a,b,4.7f,WHITE,15);stroke(b,c,4.7f,WHITE,15);stroke(c,d,4.7f,WHITE,15);
-    point_t tip={87+(113-87)*sign,250};
-    tft_fill_triangle(lroundf(tip.x),250,lroundf(d.x),240,lroundf(d.x),260,WHITE);
+    stroke(a,b,4.7f,GREEN,15);stroke(b,c,4.7f,GREEN,15);stroke(c,d,4.7f,GREEN,15);
+    point_t tip={87+(113-87)*sign,238};
+    tft_fill_triangle(lroundf(tip.x),238,lroundf(d.x),228,lroundf(d.x),248,GREEN);
+}
+static void turn_chevrons(int side) {
+    // Same six-point silhouette as the supplied reference, mirrored for right.
+    for(int i=0;i<3;i++) {
+        int x=96+i*36,y=116;
+        int px[]={x+35,x+58,x+23,x+58,x+35,x};
+        int py[]={y,y,y+42,y+84,y+84,y+42};
+        if(side>0)for(int j=0;j<6;j++)px[j]=320-px[j];
+        uint16_t c=i==1?GREEN:shade(GREEN,0.70f);
+        tft_fill_triangle(px[0],py[0],px[1],py[1],px[2],py[2],c);
+        tft_fill_triangle(px[0],py[0],px[2],py[2],px[5],py[5],c);
+        tft_fill_triangle(px[5],py[5],px[2],py[2],px[3],py[3],c);
+        tft_fill_triangle(px[5],py[5],px[3],py[3],px[4],py[4],c);
+    }
 }
 static const char *action(uint8_t d) {
     switch(d) {
@@ -137,15 +151,21 @@ static const char *action(uint8_t d) {
 static void draw_nav(void *context) {
     const round_nav_t *v=context;
     const hud_model_t *m=&v->nav;
+    bool live=v->recovery==RIDE_LIVE;
+    bool alert=ride_turn_alert(m->direction,v->maneuver_state,m->distance_m,v->recovery) && !v->overview;
     // Preserve the actual phone-projected polyline: no invented streets.
     for(unsigned i=0;i<path_count;i++)
-        stroke(path[i].a,path[i].b,3.2f,GREEN,path[i].past?6:15);
+        stroke(path[i].a,path[i].b,3.2f,GREEN,!live?3:path[i].past?6:15);
     if(v->count<2)text(160,125,"WAITING FOR ROUTE",12,MUTED);
     int rider_x=RIDER_X,rider_y=RIDER_Y;
     if(v->overview && v->count){point_t p=route_point(v,0);rider_x=lroundf(p.x);rider_y=lroundf(p.y);}
-    arrow(rider_x,rider_y,v->overview?m->heading:v->tilt);
+    if(live && !alert)arrow(rider_x,rider_y,v->overview?m->heading:v->tilt);
+    if(alert) {
+        tft_fill_rect(45,111,230,100,BLACK);
+        if(v->blink_on)turn_chevrons(ride_turn_side(m->direction));
+    }
     char value[24];
-    if(m->speed_valid)snprintf(value,sizeof(value),"%u",m->speed);
+    if(m->speed_valid && live)snprintf(value,sizeof(value),"%u",m->speed);
     else strcpy(value,"--");
     overlay_text(54,52,value,28,WHITE,80);
     overlay_text(55,83,"km/h",10,MUTED,55);
@@ -155,17 +175,30 @@ static void draw_nav(void *context) {
         77-lroundf(11*cosf(north)),3,WHITE);
     overlay_text(257,85,"N",10,WHITE,20);
     // Clear just the lower guidance area after painting the route.
-    tft_fill_rect(35,235,250,72,BLACK);
-    turn_arrow(m->direction);
-    if(m->distance_m>=1000)snprintf(value,sizeof(value),"%.1f km",m->distance_m/1000.0f);
+    tft_fill_rect(35,222,250,88,BLACK);
+    if(live)turn_arrow(m->direction);
+    if(!live)strcpy(value,"-- m");
+    else if(m->distance_m>=1000)snprintf(value,sizeof(value),"%.1f km",m->distance_m/1000.0f);
     else snprintf(value,sizeof(value),"%lu m",(unsigned long)m->distance_m);
-    unsigned size=hud_text_width(value,36)>170?22:36;
-    overlay_text(119,237,value,size,WHITE,170);
+    unsigned size=hud_text_width(value,32)>170?22:32;
+    overlay_text(119,226,value,size,WHITE,170);
     const char *label=m->instruction;
     if(strcmp(label,"PHONE OFFLINE") && strcmp(label,"SYNCING") &&
        strcmp(label,"GPS LOST") && strcmp(label,"REROUTING") && strcmp(label,"PAUSED"))
         label=action(m->direction);
-    overlay_text(119,278,label,16,WHITE,180);
+    if(!live)label="Guidance unavailable";
+    overlay_text(102,265,label,12,WHITE,185);
+    if(live && v->trip_valid)snprintf(value,sizeof(value),"ETA %s  %.1f km",v->arrival_time[0]?v->arrival_time:"--:--",m->remaining_km);
+    else strcpy(value,"ETA --:--   -- km");
+    text(160,289,value,10,MUTED);
+    static const char *states[]={"","RECONNECTING","SYNCING ROUTE","GPS WEAK","REROUTING","PAUSED","WAITING FOR PHONE"};
+    if(!live) {
+        text(160,24,states[v->recovery<=RIDE_STALE?v->recovery:RIDE_STALE],12,GREEN);
+        text(160,100,"LAST ROUTE - DATA STALE",10,MUTED);
+    } else if(v->battery_low) {
+        snprintf(value,sizeof(value),"LOW BATTERY ~%u%%",v->battery_percent);
+        text(160,24,value,10,GREEN);
+    }
     if(m->speed_limit) {
         snprintf(value,sizeof(value),"LIMIT %u",m->speed_limit);
         overlay_text(185,37,value,10,MUTED,100);
@@ -202,6 +235,19 @@ void round_ui_navigation(const round_nav_t *v) {
     prepare_route(v);
     for(nav_strip_y=0;nav_strip_y<320;nav_strip_y+=8)
         tft_draw_buffered_region(0,nav_strip_y,320,8,BLACK,draw_nav,(void*)v);
+}
+static void draw_arrival(void *unused) {
+    (void)unused;
+    text(160,57,"DESTINATION REACHED",12,GREEN);
+    tft_fill_circle(160,145,53,GREEN);tft_fill_circle(160,145,49,BLACK);
+    tft_draw_thick_line(132,144,152,164,7,GREEN);
+    tft_draw_thick_line(152,164,190,123,7,GREEN);
+    text(160,222,"You've arrived",24,WHITE);
+    text(160,259,"RIDE COMPLETE",12,GREEN);
+    text(160,282,"Returning home shortly",10,MUTED);
+}
+void round_ui_arrival(void) {
+    tft_draw_buffered_region(0,0,320,320,BLACK,draw_arrival,NULL);
 }
 typedef struct {uint8_t hours,minutes;const char *date;float remaining;} clock_t;
 static void ring(float start,float end,uint16_t color) {

@@ -66,6 +66,8 @@ typedef struct {
     char current_street[32];      // Primary navigation maneuver description
     char eta_time_str[16];        // Estimated arrival (e.g. "12:35 PM" or "999 min")
     float remaining_dist_km;      // Total route remaining distance (e.g. 4.2 km)
+    uint32_t remaining_duration_seconds;
+    bool trip_data_valid;
     uint16_t speed_kmh;           // Live vehicle speed (km/h)
     uint16_t heading_deg;         // Vehicle heading in degrees (0..359)
     bool is_navigating;           // Active turn-by-turn guidance flag

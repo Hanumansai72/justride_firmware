@@ -109,16 +109,38 @@ __declspec(dllexport) int render_round(void) {
     // SAMPLE TELEMETRY ONLY: same production renderer, no device/GPS claims.
     round_route_point_t points[]={{160,160},{160,135},{160,110},{194,90},{208,66},{178,42},{166,8}};
     round_nav_t v={.nav={.speed=45,.speed_valid=true,.direction=5,.distance_m=300,.heading=0},
-        .points=points,.count=7,.zoom_percent=100};
+        .points=points,.count=7,.zoom_percent=100,.trip_valid=true,.arrival_time="14:42"};
+    v.nav.remaining_km=12.8f;
     round_ui_navigation(&v);capture_save("navigation.rgb565");
     memcpy(previous,capture_pixels(),sizeof previous);
     v.nav.direction=4;round_ui_navigation(&v);capture_save("navigation-left.rgb565");
     assert(memcmp(previous,capture_pixels(),sizeof previous));
     v.nav.distance_m=120;round_ui_navigation(&v);capture_save("distance-update.rgb565");
+    v.nav.distance_m=80;v.maneuver_state=3;v.blink_on=true;
+    round_ui_navigation(&v);capture_save("turn-left-on.rgb565");
+    memcpy(previous,capture_pixels(),sizeof previous);
+    v.blink_on=false;round_ui_navigation(&v);capture_save("turn-left-off.rgb565");
+    assert(memcmp(previous,capture_pixels(),sizeof previous));
+    for(int yy=0;yy<320;yy++)for(int xx=0;xx<320;xx++) {
+        unsigned at=(yy*320+xx)*2;
+        if(xx>=45 && xx<275 && yy>=111 && yy<211)
+            assert(capture_pixels()[at]==0 && capture_pixels()[at+1]==0);
+        else assert(previous[at]==capture_pixels()[at] && previous[at+1]==capture_pixels()[at+1]);
+    }
+    v.nav.direction=5;v.blink_on=true;
+    round_ui_navigation(&v);capture_save("turn-right-on.rgb565");
+    v.blink_on=false;round_ui_navigation(&v);capture_save("turn-right-off.rgb565");
+    v.recovery=RIDE_STALE;round_ui_navigation(&v);capture_save("stale-data.rgb565");
+    v.recovery=RIDE_RECONNECTING;round_ui_navigation(&v);capture_save("reconnecting.rgb565");
+    v.recovery=RIDE_GPS_WEAK;round_ui_navigation(&v);capture_save("gps-weak.rgb565");
+    v.recovery=RIDE_LIVE;v.nav.distance_m=300;v.battery_low=true;v.battery_percent=12;
+    round_ui_navigation(&v);capture_save("low-battery.rgb565");v.battery_low=false;
+    round_ui_arrival();capture_save("arrival.rgb565");
     v.nav.distance_m=300;v.nav.speed_valid=false;strcpy(v.nav.instruction,"GPS LOST");
+    v.recovery=RIDE_GPS_WEAK;
     round_ui_navigation(&v);capture_save("gps-lost.rgb565");
-    strcpy(v.nav.instruction,"PHONE OFFLINE");round_ui_navigation(&v);capture_save("phone-offline.rgb565");
-    strcpy(v.nav.instruction,"");v.nav.speed_valid=true;v.nav.direction=5;v.overview=true;
+    strcpy(v.nav.instruction,"PHONE OFFLINE");v.recovery=RIDE_RECONNECTING;round_ui_navigation(&v);capture_save("phone-offline.rgb565");
+    strcpy(v.nav.instruction,"");v.recovery=RIDE_LIVE;v.nav.speed_valid=true;v.nav.direction=5;v.overview=true;
     round_ui_navigation(&v);capture_save("overview.rgb565");
     v.overview=false;v.count=0;strcpy(v.nav.instruction,"SYNCING");
     round_ui_navigation(&v);capture_save("waiting-for-route.rgb565");
@@ -159,6 +181,7 @@ for file in OUT.glob('*.rgb565'):
     mask=Image.new('L',(466,466));ImageDraw.Draw(mask).ellipse((0,0,465,465),fill=255)
     result=Image.new('RGB',(506,506),'#111719');result.paste(canvas,(20,20),mask)
     result.save(file.with_suffix('.png'))
+    canvas.save(file.with_name(file.stem+'-native.png'))
 sheet=Image.new('RGB',(1530,1100),'#111719');draw=ImageDraw.Draw(sheet)
 labels=[('navigation','NAVIGATION / RIGHT'),('clock','CLOCK'),('music','MUSIC'),('navigation-left','NAVIGATION / LEFT'),('call','INCOMING CALL'),('notification','NOTIFICATION')]
 for i,(name,label) in enumerate(labels):
@@ -167,6 +190,20 @@ for i,(name,label) in enumerate(labels):
     sheet.paste(Image.open(OUT/(name+'.png')),(x,y+35))
 draw.text((20,1080),'Production C renderer with SAMPLE data. Physical panel/touch/radio operation requires hardware testing.',fill='white')
 sheet.save(OUT/'screens.png')
+ux=Image.new('RGB',(1530,1650),'#111719');d=ImageDraw.Draw(ux)
+for i,(name,label) in enumerate([
+    ('turn-left-on','LEFT TURN / BLINK ON'),('turn-right-on','RIGHT TURN / BLINK ON'),('turn-left-off','LEFT TURN / BLINK OFF'),
+    ('navigation','LIVE ETA + REMAINING'),('reconnecting','RECONNECTING / STALE ROUTE'),('gps-weak','GPS WEAK / STALE ROUTE'),
+    ('low-battery','LOW BATTERY'),('arrival','ARRIVAL'),('stale-data','NO RECENT PHONE DATA')]):
+    x=(i%3)*510;y=(i//3)*550;d.text((x+24,y+12),label,fill='white')
+    ux.paste(Image.open(OUT/(name+'.png')),(x,y+35))
+d.text((20,1630),'Production renderer / SAMPLE data. Each round display is 466 x 466 pixels. Hardware test still required.',fill='white')
+ux.save(OUT/'ride-experience.png')
+for side in ['left','right']:
+    frames=[Image.open(OUT/f'turn-{side}-{phase}.png') for phase in ['on','off']]
+    frames[0].save(OUT/f'turn-{side}-blink.gif',save_all=True,append_images=frames[1:],duration=500,loop=0)
+    native=[Image.open(OUT/f'turn-{side}-{phase}-native.png') for phase in ['on','off']]
+    native[0].save(OUT/f'turn-{side}-blink-466.gif',save_all=True,append_images=native[1:],duration=500,loop=0)
 if args.reference:
     reference=Image.open(args.reference).convert('RGB')
     comparison=Image.new('RGB',(1040,570),'#111719');d=ImageDraw.Draw(comparison)

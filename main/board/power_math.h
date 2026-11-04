@@ -9,6 +9,17 @@ typedef struct {
     uint8_t source, percent; // 0 unknown, 1 battery inferred, 2 USB inferred
     bool valid;
 } device_power_t;
+static inline bool power_is_low(device_power_t p) {
+    return p.valid && p.source==1 && p.percent<=15;
+}
+typedef struct {unsigned samples;bool warned;} power_warning_t;
+static inline bool power_warning_update(power_warning_t *w,device_power_t p) {
+    if(p.valid && (p.source==2 || (p.source==1 && p.percent>=20)))w->warned=false;
+    if(!power_is_low(p)){w->samples=0;return false;}
+    if(w->samples<5)w->samples++;
+    if(w->samples<5 || w->warned)return false;
+    w->warned=true;return true;
+}
 static inline uint8_t power_percent(uint16_t mv) {
     static const uint16_t volts[]={3300,3500,3600,3700,3750,3800,3900,4000,4100,4200};
     static const uint8_t pct[]={0,10,20,40,50,60,75,85,95,100};

@@ -16,6 +16,44 @@ Image view, brightness, settings and OTA retain their existing 320×240 layout
 inside a rectangle that fits entirely within the circular display; their touch
 coordinates are mapped through the same transform.
 
+### Riding experience
+
+- Within 100 m of a left/right maneuver, three large **green chevrons** use the
+  supplied reference silhouette, mirrored for right. They blink 500 ms on / 500
+  ms off. The smaller direction arrow and distance remain visible during blink
+  off. Completed maneuvers, overview, paused or unreliable guidance do not blink.
+- The lower guidance panel includes arrival clock time (24-hour `ETA HH:MM`) and
+  total remaining kilometres from the phone's existing route telemetry. A valid
+  phone-synchronized clock is required for ETA; unavailable values show dashes.
+- Disconnect shows `RECONNECTING`; service setup shows `SYNCING ROUTE`. No
+  navigation packet for five seconds shows `WAITING FOR PHONE`. Old routes are
+  dimmed and labelled `LAST ROUTE - DATA STALE`, with speed, turn distance and trip
+  values hidden. A fresh valid packet restores guidance without a confirmation.
+- The APK sends a navigation heartbeat every two seconds while a ride is active.
+  This does **not** refresh an old GPS fix: fixes older than ten seconds or with
+  accuracy worse than 50 m produce `GPS WEAK` on the display and suppress turn
+  alerts. The existing longer phone GPS recovery loop continues in the background.
+- `LOW BATTERY` appears on navigation at an estimated level ≤15%, only when supply
+  measurements infer battery power. Five consecutive one-second low samples
+  trigger one notification; it rearms after USB power or an estimate ≥20%. Missing
+  measurements do not invent a warning. The APK power card also shows the warning.
+- Confirmed arrival shows a **green checkmark**, `You've arrived`, and
+  `RIDE COMPLETE`, then returns Home after ten seconds. Reconnecting at arrival
+  no longer immediately sends a stop packet over that screen.
+- APK Device Settings offers **Phone turn vibration**, off by default and saved
+  on the phone. It uses native haptic feedback once per nearby left/right maneuver,
+  checks GPS freshness, and suppresses repeats, pause, rerouting and completed turns.
+  Phone haptic settings/hardware determine whether vibration is perceptible.
+
+![Riding experience — production renderer with SAMPLE data](docs/previews/ride-experience.png)
+
+[Left turn blink, native 466×466](docs/previews/turn-left-blink-466.gif) ·
+[Right turn blink, native 466×466](docs/previews/turn-right-blink-466.gif) ·
+[Arrival, native 466×466](docs/previews/arrival-native.png).
+The preview's outside margin is decorative; the actual panel is 466×466.
+The firmware retains its existing 320×320 logical drawing canvas and maps it
+through the production panel transform. No photograph or hardware timing is claimed.
+
 ![Navigation, clock, music, call and notification — SAMPLE DATA](docs/previews/screens.png)
 
 ![Splash — black footer, no waves](docs/previews/splash.png)

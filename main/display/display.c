@@ -2,6 +2,7 @@
 #include "map_frame.h"
 #include "hud_ui.h"
 #include "round_ui.h"
+#include "device_power.h"
 #include "display.h"
 #include "freertos/queue.h"
 #include "esp_heap_caps.h"
@@ -34,6 +35,10 @@ static uint8_t s_time_hours = 14;
 static uint8_t s_time_minutes = 5;
 static bool s_ble_connected = false;
 static bool s_phone_state_ready = false;
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+static int64_t s_last_nav_received_us;
+static char s_arrival_time[8];
+#endif
 typedef struct { uint8_t state,actions; char caller[48]; } call_info_t;
 static call_info_t s_call;
 static bool s_call_painted;
@@ -1010,19 +1015,41 @@ static void display_nav_render_partial(void) {
   bool first=!s_hud.is_frame_active;
 #if CONFIG_JUSTRIDE_ROUND_AMOLED
   tft_set_round_canvas(true);
+  if(model.direction==NAV_DIR_REACHED) {
+    if(first || s_notif_dirty)round_ui_arrival();
+    s_hud.is_frame_active=true;s_notif_dirty=false;return;
+  }
   static uint32_t map_serial,marker_serial;
   static int last_tilt;
+  static uint8_t last_recovery,last_battery;
+  static bool last_blink;
+  static bool last_trip_valid;
+  static char last_arrival_time[8];
+  int64_t now=esp_timer_get_time();
+  uint8_t recovery=ride_recovery(s_ble_connected,s_phone_state_ready,s_nav.gps_available,
+      s_nav.rerouting,!strcmp(s_nav.current_street,"PAUSED"),now-s_last_nav_received_us);
+  bool alert=ride_turn_alert(model.direction,s_nav.maneuver_state,model.distance_m,recovery) && !s_route_seg.overview;
+  bool blink=alert && ride_blink_on(now);
+  device_power_t power=device_power_snapshot();
+  bool battery_low=power_is_low(power);
+  uint8_t battery=battery_low?power.percent:255;
   int tilt=(int)lroundf(rider_motion_degrees()/2)*2;
   if(first || s_route_seg_dirty || memcmp(&model,&s_last_hud,sizeof(model)) ||
       map_serial!=map_frame_paint_serial() || marker_serial!=map_frame_marker_serial() ||
-      tilt!=last_tilt || s_notif_dirty) {
+      tilt!=last_tilt || s_notif_dirty || recovery!=last_recovery || blink!=last_blink || battery!=last_battery ||
+      last_trip_valid!=s_nav.trip_data_valid || strcmp(last_arrival_time,s_arrival_time)) {
     round_route_point_t points[ROUTE_MAX_POINTS];
     for(unsigned i=0;i<s_route_seg.count;i++){points[i].x=s_route_seg.points[i].x;points[i].y=s_route_seg.points[i].y;}
     round_nav_t view={.nav=model,.points=points,.count=s_route_seg.count,
         .completed=s_route_seg.completed_segment_count,.tilt=tilt,.zoom_percent=route_zoom_percent(),
-        .overview=s_route_seg.overview};
+        .overview=s_route_seg.overview,.recovery=recovery,.maneuver_state=s_nav.maneuver_state,
+        .blink_on=blink,.battery_low=battery_low,.battery_percent=power.percent,.trip_valid=s_nav.trip_data_valid};
+    snprintf(view.arrival_time,sizeof(view.arrival_time),"%s",s_arrival_time);
     round_ui_navigation(&view);
     map_serial=map_frame_paint_serial();marker_serial=map_frame_marker_serial();last_tilt=tilt;
+    last_recovery=recovery;last_blink=blink;last_battery=battery;
+    last_trip_valid=s_nav.trip_data_valid;
+    snprintf(last_arrival_time,sizeof(last_arrival_time),"%s",s_arrival_time);
     s_last_hud=model;s_hud.is_frame_active=true;s_route_seg_dirty=false;
     s_notif_dirty=false;
     render_notification_banner();render_route_resume_modal();
@@ -2121,6 +2148,10 @@ static void nav_render_task(void *pvParam) {
         if(connected && s_nav.is_navigating){s_zoom_pending=true;s_zoom_due_us=esp_timer_get_time()+500000;}
         s_call_painted=false;
         s_phone_state_ready = false;
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+        s_last_nav_received_us=0;
+        if(!connected)xQueueReset(s_nav_queue);
+#endif
         s_media = (media_state_t){.state = 6};
         s_media_dirty = true;
         s_route_seg_dirty = true;
@@ -2312,6 +2343,16 @@ void display_update_navigation(const navigation_data_t *nav_data) {
 static void apply_navigation(const navigation_data_t *nav_data) {
   if (!nav_data)
     return;
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+  if(!s_ble_connected)return;
+  s_last_nav_received_us=esp_timer_get_time();
+  s_arrival_time[0]=0;
+  if(nav_data->trip_data_valid && time_is_synchronized()) {
+    time_t eta=time(NULL)+(time_t)nav_data->remaining_duration_seconds;
+    struct tm arrival;
+    if(localtime_r(&eta,&arrival))strftime(s_arrival_time,sizeof(s_arrival_time),"%H:%M",&arrival);
+  }
+#endif
 
   if (!s_phone_state_ready) s_route_seg_dirty = true;
   s_phone_state_ready = true;

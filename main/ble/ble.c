@@ -693,6 +693,8 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
         nav_data.distance_meters = maneuver_dist;
         nav_data.speed_kmh = speed;
         nav_data.remaining_dist_km = (float)rem_dist / 1000.0f;
+        nav_data.remaining_duration_seconds=eta_secs;
+        nav_data.trip_data_valid=p_eta && p_rem;
         nav_data.is_navigating = nav_data.direction != NAV_DIR_REACHED;
         nav_data.gps_available = true;
         snprintf(nav_data.eta_time_str, sizeof(nav_data.eta_time_str), "%lu min", (unsigned long)(eta_secs / 60));
@@ -910,18 +912,22 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
         bool is_reroute = (flags & (1 << 1)) != 0 || (opcode == NAV_OP_REROUTE);
         bool gps_ok = (flags & (1 << 2)) != 0;
 
-        nav_data.direction = ble_code_to_nav_direction(maneuver);
+        nav_data.direction = opcode==NAV_OP_ARRIVED ? NAV_DIR_REACHED : ble_code_to_nav_direction(maneuver);
         nav_data.maneuver_state = maneuver_state;
         nav_data.maneuver_id = maneuver_id;
         nav_data.distance_meters = maneuver_dist;
         nav_data.speed_kmh = gps_ok ? (uint16_t)speed : 0;
         nav_data.heading_deg = heading;
         nav_data.remaining_dist_km = (float)rem_dist / 1000.0f;
+        nav_data.remaining_duration_seconds=rem_dur;
+        nav_data.trip_data_valid=true;
         nav_data.is_navigating = is_nav && (opcode != NAV_OP_ARRIVED);
         nav_data.gps_available = gps_ok;
         nav_data.rerouting = is_reroute;
 
-        if (opcode == NAV_OP_REROUTE || is_reroute) {
+        if(opcode==NAV_OP_PAUSE || (flags&(1<<4))) {
+            strncpy(nav_data.current_street,"PAUSED",sizeof(nav_data.current_street)-1);
+        } else if (opcode == NAV_OP_REROUTE || is_reroute) {
             strncpy(nav_data.current_street, "REROUTING...", sizeof(nav_data.current_street) - 1);
         } else if (opcode == NAV_OP_ARRIVED) {
             strncpy(nav_data.current_street, "DESTINATION REACHED", sizeof(nav_data.current_street) - 1);

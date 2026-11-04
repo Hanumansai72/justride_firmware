@@ -1,6 +1,7 @@
 #include "sdkconfig.h"
 #include "device_power.h"
 #include "ble.h"
+#include "display.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -19,6 +20,7 @@ device_power_t device_power_snapshot(void) {
 }
 static void power_task(void *unused) {
     unsigned ticks=0;
+    power_warning_t warning={0};
     for(;;) {
         int sum=0,raw,minimum=4096,maximum=0;
         bool ok=true;
@@ -31,6 +33,9 @@ static void power_task(void *unused) {
         device_power_t p=power_measurement(ok?mv:0,CONFIG_JR_POWER_GAIN_PERMILLE,
             device_power_snapshot().source);
         portENTER_CRITICAL(&power_lock);latest=p;portEXIT_CRITICAL(&power_lock);
+        if(power_warning_update(&warning,p)) {
+            display_show_app_notification("JustRide","LOW BATTERY","Battery estimate below 15%. Charge soon.");
+        }
         if(ticks++%5==0)device_power_publish();
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
