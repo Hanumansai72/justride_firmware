@@ -58,10 +58,24 @@ static void touch_task(void *pvParam) {
     bool tap_pending=false, second_tap=false, zoom_drag=false;
     int16_t tap_x=0,tap_y=0,zoom_y=0;
     uint32_t tap_ms=0,zoom_ms=0;
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    bool wake_contact=false;
+#endif
 
     while (1) {
         bool is_down = touch_get_point(&pt);
         uint32_t now=xTaskGetTickCount()*portTICK_PERIOD_MS;
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+        if(pt.is_pressed && display_touch_activity())wake_contact=true;
+        if(wake_contact) {
+            state=GESTURE_IDLE;confirm_count=0;
+            tap_pending=second_tap=zoom_drag=false;
+            if(pt.is_pressed)release_count=0;
+            else if(++release_count>=2){wake_contact=false;release_count=0;}
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue; // First contact wakes only; never also presses a hidden button.
+        }
+#endif
 
         switch (state) {
 

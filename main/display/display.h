@@ -174,6 +174,8 @@ void display_set_imu_override_direction(nav_direction_t dir);
 void display_handle_touch_event(int16_t start_x, int16_t start_y,
                                 int16_t end_x,   int16_t end_y,
                                 touch_gesture_t gesture);
+// Record physical contact; true means consume this whole contact as wake-only.
+bool display_touch_activity(void);
 bool display_nav_touch_zoom_allowed(int16_t x,int16_t y);
 
 /** Update real-time clock (called by rtc_time.c) */

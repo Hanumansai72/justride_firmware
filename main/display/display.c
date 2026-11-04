@@ -3,6 +3,8 @@
 #include "hud_ui.h"
 #include "round_ui.h"
 #include "device_power.h"
+#include "display_idle.h"
+#include "round_panel.h"
 #include "display.h"
 #include "freertos/queue.h"
 #include "esp_heap_caps.h"
@@ -38,6 +40,9 @@ static bool s_phone_state_ready = false;
 #if CONFIG_JUSTRIDE_ROUND_AMOLED
 static int64_t s_last_nav_received_us;
 static char s_arrival_time[8];
+static display_idle_t s_idle;
+static portMUX_TYPE s_idle_lock=portMUX_INITIALIZER_UNLOCKED;
+static bool s_panel_asleep,s_touch_pending;
 #endif
 typedef struct { uint8_t state,actions; char caller[48]; } call_info_t;
 static call_info_t s_call;
@@ -1686,6 +1691,17 @@ void display_handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x,
   handle_touch_event(start_x, start_y, end_x, end_y, gesture);
   xSemaphoreGiveRecursive(s_display_mutex);
 }
+bool display_touch_activity(void) {
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+  portENTER_CRITICAL(&s_idle_lock);
+  s_touch_pending=true;
+  bool waking=s_panel_asleep;
+  portEXIT_CRITICAL(&s_idle_lock);
+  return waking;
+#else
+  return false;
+#endif
+}
 
 static void handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x,
                                 int16_t end_y, touch_gesture_t gesture) {
@@ -2198,6 +2214,28 @@ static void nav_render_task(void *pvParam) {
         if(ble_nav_notify_diagnostic_packet(packet,sizeof(packet)))s_zoom_pending=false;
         else s_zoom_due_us=esp_timer_get_time()+500000;
       }
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+      int64_t idle_now=esp_timer_get_time();
+      bool busy=s_nav.is_navigating || s_current_screen==SCREEN_OTA || s_call.state==1 ||
+          (s_current_screen==SCREEN_MUSIC && s_ble_connected && s_media.state==4) ||
+          (s_arrival_started_us && idle_now-s_arrival_started_us<ARRIVAL_DISPLAY_US);
+      portENTER_CRITICAL(&s_idle_lock);
+      int idle_action=display_idle_update(&s_idle,idle_now,busy,s_touch_pending);
+      s_touch_pending=false;
+      if(idle_action<0)s_panel_asleep=true;
+      portEXIT_CRITICAL(&s_idle_lock);
+      if(idle_action) {
+        round_panel_standby(idle_action<0);
+        if(idle_action>0) {
+          portENTER_CRITICAL(&s_idle_lock);s_panel_asleep=false;portEXIT_CRITICAL(&s_idle_lock);
+        }
+        ESP_LOGI(TAG,"Display standby %s; BLE/touch remain active",idle_action<0?"on":"off");
+      }
+      if(s_idle.asleep) {
+        xSemaphoreGiveRecursive(s_display_mutex);
+        continue;
+      }
+#endif
       if(s_call.state==1 && s_current_screen!=SCREEN_OTA) {
         if(!s_call_painted){
 #if CONFIG_JUSTRIDE_ROUND_AMOLED
@@ -2257,6 +2295,9 @@ void display_init(void) {
     configASSERT(created == pdPASS);
   }
 
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+  s_idle.last_activity_us=esp_timer_get_time();
+#endif
   s_is_initialized = true;
 }
 

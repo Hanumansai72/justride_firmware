@@ -111,6 +111,12 @@ __declspec(dllexport) int render_round(void) {
     round_nav_t v={.nav={.speed=45,.speed_valid=true,.direction=5,.distance_m=300,.heading=0},
         .points=points,.count=7,.zoom_percent=100,.trip_valid=true,.arrival_time="14:42"};
     v.nav.remaining_km=12.8f;
+    v.nav.direction=8;v.nav.distance_m=70;v.nav.speed=28;
+    round_ui_navigation(&v);capture_save("u-turn.rgb565");
+    v.nav.direction=11;v.nav.distance_m=150;v.nav.speed=45;
+    strcpy(v.nav.instruction,"Take flyover");
+    round_ui_navigation(&v);capture_save("flyover-current.rgb565");
+    v.nav.direction=5;v.nav.distance_m=300;strcpy(v.nav.instruction,"");
     round_ui_navigation(&v);capture_save("navigation.rgb565");
     memcpy(previous,capture_pixels(),sizeof previous);
     v.nav.direction=4;round_ui_navigation(&v);capture_save("navigation-left.rgb565");
@@ -199,6 +205,12 @@ for i,(name,label) in enumerate([
     ux.paste(Image.open(OUT/(name+'.png')),(x,y+35))
 d.text((20,1630),'Production renderer / SAMPLE data. Each round display is 466 x 466 pixels. Hardware test still required.',fill='white')
 ux.save(OUT/'ride-experience.png')
+guide=Image.new('RGB',(1020,570),'#111719');d=ImageDraw.Draw(guide)
+for i,(name,label) in enumerate([('u-turn','U-TURN / CURRENT IMPLEMENTATION'),('flyover-current','FLYOVER REQUEST / CURRENT GENERIC EXIT FALLBACK')]):
+    d.text((i*510+15,12),label,fill='white')
+    guide.paste(Image.open(OUT/(name+'.png')),(i*510,35))
+d.text((15,550),'Production C renderer, SAMPLE route. Flyover-specific instructions/road level are not implemented.',fill='white')
+guide.save(OUT/'u-turn-flyover-current.png')
 for side in ['left','right']:
     frames=[Image.open(OUT/f'turn-{side}-{phase}.png') for phase in ['on','off']]
     frames[0].save(OUT/f'turn-{side}-blink.gif',save_all=True,append_images=frames[1:],duration=500,loop=0)

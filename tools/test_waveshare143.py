@@ -64,11 +64,13 @@ fixture=r'''
 #include "power_math.h"
 #include "motion_math.h"
 #include "ride_ux.h"
+#include "display_idle.h"
 int _fltused;
 #include "round_panel.c"
 #include "touch_ft3168.c"
 static uint8_t storage[466*466*2],gram[466*466*2],id_value=0x86;
 static unsigned id_bit,transfers;
+static int panel_on;
 static int x1,x2,y1,y2,power,brightness,format_value;
 static uint8_t touch_report[5];
 static bool read_fail;
@@ -93,6 +95,8 @@ int spi_device_polling_transmit(void *dev,spi_transaction_t *t){
  ++transfers;
  const uint8_t *p=t->tx_buffer;
  unsigned reg=t->addr>>8;
+ if(reg==0x28)panel_on=0;
+ if(reg==0x29)panel_on=1;
  if(reg==0x51)brightness=p[0];
  if(reg==0x3a)format_value=p[0];
  if(reg==0x2a){x1=(p[0]<<8)|p[1];x2=(p[2]<<8)|p[3];}
@@ -135,7 +139,25 @@ __declspec(dllexport) int run_board_checks(void){
   assert(!memcmp(storage,gram,sizeof storage));
   assert(storage[(101*466+57)*2]==0xff); // legacy pane origin
   assert(storage[0]==0); // unused round margins stay black
+  round_panel_standby(true);assert(display_off && !panel_on && power==1);
+  before=transfers;round_panel_standby(true);assert(transfers==before);
+  round_panel_window(0,0,2,1);round_panel_pixels((uint8_t[]){0x07,0xe0,0xff,0xff},4);
+  round_panel_flush();assert(transfers==before); // Shadow can change; no writes to a sleeping panel.
+  round_panel_standby(false);assert(!display_off && panel_on && power==1);
+  assert(!memcmp(storage,gram,sizeof storage));assert(brightness==63);
+  before=transfers;round_panel_standby(false);assert(transfers==before);
  }
+ display_idle_t idle={.last_activity_us=1000000};
+ assert(display_idle_update(&idle,15999999,false,false)==0 && !idle.asleep);
+ assert(display_idle_update(&idle,16000000,false,false)==-1 && idle.asleep);
+ assert(display_idle_update(&idle,17000000,false,false)==0 && idle.asleep);
+ assert(display_idle_update(&idle,18000000,false,true)==1 && !idle.asleep);
+ assert(display_idle_update(&idle,32999999,false,false)==0);
+ assert(display_idle_update(&idle,33000000,false,false)==-1);
+ assert(display_idle_update(&idle,34000000,true,false)==1); // Ride/call/OTA wake.
+ assert(display_idle_update(&idle,90000000,true,false)==0 && !idle.asleep);
+ assert(display_idle_update(&idle,104999999,false,false)==0);
+ assert(display_idle_update(&idle,105000000,false,false)==-1);
  // Stock board power: ADC = VCC/3, USB must never imply charging or a full battery.
  device_power_t p=power_measurement(1250,1000,0);
  assert(p.valid && p.rail_mv==3750 && p.battery_mv==3750 && p.percent==50 && p.source==1);
@@ -206,6 +228,10 @@ __declspec(dllexport) int run_board_checks(void){
  touch_report[1]=0x40;assert(!touch_get_point(&point) && !point.is_pressed);
  touch_report[1]=0x80;read_fail=true;
  assert(!touch_get_point(&point) && !point.is_pressed && point.pressure==0);
+ read_fail=false;round_panel_canvas(false);
+ memcpy(touch_report,(uint8_t[]){1,0x80,233,0,25},5);
+ assert(!touch_get_point(&point) && point.is_pressed); // Outside settings pane still wakes.
+ touch_report[1]=0x40;assert(!touch_get_point(&point) && !point.is_pressed);
  return 0;
 }
 '''

@@ -72,6 +72,9 @@ esp_err_t touch_init(void);
  * @return true   Screen is being touched and coordinates are valid.
  * @return false  Not touched, rejected, or reading failed. For non-NULL point,
  *                is_pressed=false and pressure=0; x/y are valid only on true.
+ *                FT3168 exception: a valid contact outside the active canvas
+ *                returns false with is_pressed=true for wake-only handling.
+ *                Its x/y must still not be used for gestures.
  */
 bool touch_get_point(touch_point_t *point);
 

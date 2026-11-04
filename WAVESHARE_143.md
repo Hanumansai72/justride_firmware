@@ -73,6 +73,12 @@ The SD card is not needed by the current firmware.
 
 ## Touch
 
+After 15 seconds with no active use or physical touch, the AMOLED enters display
+standby. BLE/touch/CPU/IMU stay active. Touch wakes it (first contact is wake-only),
+or a ride/call/OTA wakes it automatically. Playing music on its own screen and
+the arrival screen keep it awake. The original 2.8-inch profile is unchanged.
+See [current navigation limitations, actual U-turn/flyover previews and standby verification](NAVIGATION_GAPS.md).
+
 - Swipe between the existing screens.
 - Navigation double-tap zooms in. Double-tap, keep the second press down and drag
   vertically for zoom in/out. This reuses the established five phone camera levels.
@@ -211,7 +217,7 @@ It also checks stock divider conversion, USB/unknown behavior, monotonic battery
 estimates, exact power packets and gravity-projected turning/integration/wrap.
 The preview tool checks round hitbox mapping, FT3168 reports, QMI8658 signed
 samples, splash animation boundaries and changing maneuver output.
-The existing touch suite checks 392 driver/gesture cases.
+The touch suite checks 404 driver/gesture/wake cases across four rotations.
 
 Build/tests establish source and binary consistency. A bench test is still needed
 for actual panel model, touch orientation, color order, IMU axes, BLE connection,

@@ -25,6 +25,7 @@ bool touch_get_point(touch_point_t *p) {
 #if CONFIG_JR_TOUCH_MIRROR_Y
     y=465-y;
 #endif
-    if(!round_panel_touch(x,y,&p->x,&p->y))return false;
-    p->pressure=1;p->is_pressed=true;return true;
+    // Preserve raw contact outside the inscribed auxiliary canvas for wake-only.
+    p->pressure=1;p->is_pressed=true;
+    return round_panel_touch(x,y,&p->x,&p->y);
 }

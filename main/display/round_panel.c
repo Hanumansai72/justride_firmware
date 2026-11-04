@@ -15,6 +15,7 @@
 
 static spi_device_handle_t panel;
 static bool full_round;
+static bool display_off;
 static esp_err_t transfer_error;
 static int wx,wy,ww,wh,row,column,x_offset;
 static uint8_t *frame;
@@ -37,7 +38,7 @@ static void native_window(int y,int height) {
     uint8_t b[]={y>>8,y,(y+height-1)>>8,y+height-1};command(0x2B,b,4);
 }
 void round_panel_flush(void) {
-    if(!panel || !frame || dirty_top>=dirty_bottom)return;
+    if(!panel || !frame || display_off || dirty_top>=dirty_bottom)return;
     // Even-row alignment matches the vendor rounder. PSRAM -> internal DMA.
     int top=dirty_top&~1,bottom=(dirty_bottom+1)&~1;
     for(int y=top;y<bottom;y+=16) {
@@ -73,6 +74,22 @@ void round_panel_pixels(const uint8_t *data,size_t length) {
 void round_panel_brightness(uint8_t p) {
     if(!panel)return;
     tft_spi_lock();parameter(0x51,(p>100?100:p)*255/100);tft_spi_unlock();
+}
+void round_panel_standby(bool asleep) {
+    if(!panel)return;
+    tft_spi_lock();
+    if(display_off!=asleep) {
+        if(asleep) {
+            command(0x28,NULL,0); // DCS display off; retain controller/GRAM and brightness.
+            display_off=true;
+        } else {
+            display_off=false;
+            dirty_top=0;dirty_bottom=466;
+            round_panel_flush(); // Restore the whole shadow frame before display on.
+            command(0x29,NULL,0);
+        }
+    }
+    tft_spi_unlock();
 }
 void round_panel_canvas(bool round) {
     if(full_round==round)return;

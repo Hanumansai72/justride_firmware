@@ -142,6 +142,9 @@ static touch_point_t frames[128];
 static bool zoom_enabled;
 static bool display_nav_touch_zoom_allowed(int16_t x,int16_t y){(void)x;(void)y;return zoom_enabled;}
 static int frame_count,frame_index,event_count,last_gesture;
+static bool simulated_sleep;
+static bool display_touch_activity(void){bool wake=simulated_sleep;simulated_sleep=false;return wake;}
+#define CONFIG_JUSTRIDE_ROUND_AMOLED 1
 #define portTICK_PERIOD_MS 10
 #define pdMS_TO_TICKS(ms) ((ms)/portTICK_PERIOD_MS)
 static uint32_t xTaskGetTickCount(void){return (uint32_t)frame_index*2;}
@@ -188,7 +191,15 @@ static void gesture_checks(void){
  zoom_enabled=false;
  frames[0]=down(200,100);frames[4]=down(200,100);replay(9,2,TOUCH_GESTURE_TAP);
 }
-__declspec(dllexport) int run_touch_tests(void){driver_checks();gesture_checks();return failures+test_assert_failures;}
+static void wake_checks(void){
+ zoom_enabled=false;
+ simulated_sleep=true;for(int i=0;i<20;i++)frames[i]=down(100+i*4,100);
+ frames[10]=(touch_point_t){0}; // A single bad/release sample must not end the wake-only hold.
+ replay(24,0,0); // Wake-only contact must not become a swipe, tap, or zoom after wake.
+ simulated_sleep=true;frames[0]=down(100,100);frames[4]=down(100,100);
+ replay(9,1,TOUCH_GESTURE_TAP); // The next separate contact works normally.
+}
+__declspec(dllexport) int run_touch_tests(void){driver_checks();gesture_checks();wake_checks();return failures+test_assert_failures;}
 __declspec(dllexport) int check_count(void){return checks;}
 '''
 main = (ROOT / 'main/main.c').read_text(encoding='utf-8')

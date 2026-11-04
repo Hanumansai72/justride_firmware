@@ -4,12 +4,12 @@ Software verification passed before pushing this branch.
 
 | Check | Result |
 |---|---|
-| ESP-IDF 5.5.5 / ESP32-S3 build | Pass; application 821,296 bytes, 54% OTA-slot space free |
-| ESP-IDF 5.5.5 / original ESP32 2.8-inch build | Pass; application 769,328 bytes, 57% OTA-slot space free |
+| ESP-IDF 5.5.5 / ESP32-S3 build | Pass; application 822,016 bytes, 54% OTA-slot space free |
+| ESP-IDF 5.5.5 / original ESP32 2.8-inch build | Pass; application 769,312 bytes, 57% OTA-slot space free |
 | Actual QSPI transport with mocked SPI/GPIO | Pass for SH8601 and CO5300 IDs/offsets, fragmented writes, even-row DMA and unchanged-row suppression |
 | Actual FT3168 driver with mocked I2C | Pass for contact mapping, release and read failure |
 | Round C renderer and geometry | Pass; all preview screens generated from the production functions |
-| Existing XPT2046/gesture suite | Pass; 98 checks × four rotations, 392 total |
+| XPT2046/gesture/wake suite | Pass; 101 checks × four rotations, 404 total |
 | Existing map receiver and camera bounds | Pass |
 | Application compiler checks | Pass; all application sources cross-compiled by ESP-IDF |
 | Git whitespace check | Pass |
@@ -17,6 +17,10 @@ Software verification passed before pushing this branch.
 | Updated APK focused analysis | Pass with informational style lints; no errors or warnings in changed files |
 | APK power/gyro, turn vibration, GPS freshness, pause flag, navigation packets, OTA chip guard, touch zoom and clock tests | Pass; 32 tests |
 | Android release APK | Pass; Flutter `build apk --release --no-pub`, approximately 59 MB |
+| Display standby policy | Pass; exact 15-second boundary, touch reset, busy wake and re-idle |
+| Both panel standby transports | Pass with mocked I/O; 0x28/0x29, duplicate suppression, no asleep pixel writes, full frame/brightness restore |
+| Raw-contact wake handling | Pass; first held touch is consumed, one isolated failed/release sample is tolerated, next separate tap works, outside-pane FT3168 contact is retained |
+| App maneuver gap diagnostics | Four reproductions passed, confirming current ramp/U-turn/roundabout/parallel-road limitations; see NAVIGATION_GAPS.md |
 
 The companion APK source is in the separate MobileApp checkout; no private app
 source is published in this firmware repository. Its power card was widget-tested

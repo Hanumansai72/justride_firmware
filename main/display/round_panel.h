@@ -11,6 +11,7 @@
 esp_err_t round_panel_init(void);
 void round_panel_flush(void);
 void round_panel_brightness(uint8_t percent);
+void round_panel_standby(bool asleep);
 void round_panel_canvas(bool round);
 bool round_panel_is_round(void);
 void round_panel_window(int x, int y, int w, int h);
