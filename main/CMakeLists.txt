@@ -14,6 +14,7 @@ idf_component_register(SRCS "main.c"
                             ${TOUCH_SOURCE}
                             "ble/ble.c"
                             "time/rtc_time.c"
+                            "board/device_power.c"
                             "mpu6500/mpu6500.c"
                        INCLUDE_DIRS "."
                                     "ota"

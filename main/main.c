@@ -10,6 +10,7 @@
 #include "ble.h"
 #include "ota.h"
 #include "mpu6500.h"
+#include "device_power.h"
 
 static const char *TAG = "JUSTRIDE_MAIN";
 
@@ -222,6 +223,7 @@ void app_main(void)
 
 
     ble_init();
+    device_power_start();
 
     // --------------------------------------------------
     // STEP 5: MPU6500 IMU — Gyro-based turn arrow rotation

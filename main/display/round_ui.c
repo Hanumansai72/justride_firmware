@@ -11,7 +11,7 @@
 
 #define BLACK 0x0000
 #define WHITE 0xFFFF
-#define GREEN WHITE
+#define GREEN JR_PRIMARY
 #define MUTED JR_RGB565(0xAEB6BC)
 static void text(int cx,int y,const char *s,unsigned size,uint16_t color) {
     int width=hud_text_width(s,size);
@@ -139,7 +139,7 @@ static void draw_nav(void *context) {
     const hud_model_t *m=&v->nav;
     // Preserve the actual phone-projected polyline: no invented streets.
     for(unsigned i=0;i<path_count;i++)
-        stroke(path[i].a,path[i].b,3.2f,WHITE,path[i].past?6:15);
+        stroke(path[i].a,path[i].b,3.2f,GREEN,path[i].past?6:15);
     if(v->count<2)text(160,125,"WAITING FOR ROUTE",12,MUTED);
     int rider_x=RIDER_X,rider_y=RIDER_Y;
     if(v->overview && v->count){point_t p=route_point(v,0);rider_x=lroundf(p.x);rider_y=lroundf(p.y);}

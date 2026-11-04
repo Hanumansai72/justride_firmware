@@ -21,6 +21,7 @@
 #if CONFIG_JUSTRIDE_ROUND_AMOLED
 #include "waveshare143.h"
 #include "board_decode.h"
+#include "motion_math.h"
 #endif
 #include "ble.h"
 #include "display.h"   // display_set_imu_override_direction(), display_set_imu_heading()
@@ -73,6 +74,12 @@ static volatile imu_motion_t s_current_motion  = IMU_MOTION_LEVEL;
 
 // Gyro bias collected during warm-up
 static float s_gyro_z_bias = 0.0f;
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+static volatile float s_turn_rate;
+static volatile bool s_gyro_read_error;
+static int64_t s_last_gyro_us;
+static esp_err_t read_turn_raw(float ax,float ay,float az,float *raw);
+#endif
 
 // Hardware status & Accelerometer baseline
 static bool  s_gyro_available    = false;
@@ -106,7 +113,21 @@ void mpu6500_publish_status(void) {
     int16_t roll = (int16_t)lroundf(s_filtered_roll * 10), pitch = (int16_t)lroundf(s_filtered_pitch * 10);
     uint8_t packet[8] = {0x1A,1,state,(uint8_t)s_current_motion,
         (uint8_t)roll,(uint8_t)((uint16_t)roll >> 8),(uint8_t)pitch,(uint8_t)((uint16_t)pitch >> 8)};
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    if(s_gyro_read_error)packet[2]=4;
+    int16_t yaw=(int16_t)lroundf(motion_signed_degrees(s_heading_deg)*10);
+    int16_t rate=(int16_t)lroundf(s_turn_rate*10);
+    uint8_t v2[13]={0x1a,2,packet[2],packet[3],packet[4],packet[5],packet[6],packet[7],
+        yaw,(uint16_t)yaw>>8,rate,(uint16_t)rate>>8,
+        (s_gyro_available?1:0)|((!s_gyro_read_error && s_last_gyro_us &&
+            esp_timer_get_time()-s_last_gyro_us<300000)?2:0)};
+    if(v2[12]&2) {
+        v2[3]=s_turn_rate< -3?IMU_MOTION_LEFT:s_turn_rate>3?IMU_MOTION_RIGHT:s_current_motion;
+    }
+    ble_nav_notify_diagnostic_packet(v2,sizeof(v2));
+#else
     ble_nav_notify_diagnostic_packet(packet,sizeof(packet));
+#endif
 }
 static int64_t s_last_sample_us;
 
@@ -115,6 +136,9 @@ const char *mpu6500_get_status(void) {
     if (!s_sensor_available) return "SENSOR NOT DETECTED";
     if (s_calibrating || s_calibration_requested) return "KEEP STILL...";
     if (s_read_error) return "SENSOR READ ERROR";
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    if (s_gyro_read_error) return "GYRO READ ERROR";
+#endif
     if (s_auto_calibration) return "WAITING FOR STILLNESS";
     if (!s_calibration_complete) return s_auto_calibration ? "WAITING FOR STILLNESS" : "CALIBRATION NEEDED";
     return "READY";
@@ -233,6 +257,17 @@ static esp_err_t i2c_read_reg(uint8_t reg, uint8_t *data, size_t len) {
 #endif
 }
 
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+static esp_err_t read_turn_raw(float ax,float ay,float az,float *raw) {
+    uint8_t bytes[6];
+    esp_err_t e=i2c_read_reg(0x3b,bytes,6);
+    if(e!=ESP_OK)return e;
+    int16_t g[3]={qmi8658_s16(bytes),qmi8658_s16(bytes+2),qmi8658_s16(bytes+4)};
+    for(int i=0;i<3;i++)if(g[i]==INT16_MIN || g[i]==INT16_MAX)return ESP_ERR_INVALID_RESPONSE;
+    *raw=motion_turn_raw(g,ax,ay,az);return ESP_OK;
+}
+#endif
+
 // =============================================================================
 // PUBLIC: READ SENSORS
 // =============================================================================
@@ -275,6 +310,13 @@ esp_err_t mpu6500_read_gyro_z(int16_t *gz_raw) {
 
 bool mpu6500_is_gyro_available(void) {
     return s_gyro_available;
+}
+bool mpu6500_turn_fresh(void) {
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    return !s_gyro_read_error && s_last_gyro_us && esp_timer_get_time()-s_last_gyro_us<300000;
+#else
+    return s_gyro_available;
+#endif
 }
 
 bool mpu6500_is_calibration_complete(void) {
@@ -670,7 +712,16 @@ static void calibration_step(bool begin) {
     int16_t sample[4] = {0};
     bool ok = mpu6500_read_accel(&sample[0], &sample[1], &sample[2]) == ESP_OK &&
               accel_sample_valid(sample[0], sample[1], sample[2]);
-    bool gyro_ok = s_gyro_available && mpu6500_read_gyro_z(&sample[3]) == ESP_OK && abs(sample[3]) < 655;
+    bool gyro_ok;
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    float turn=0;
+    gyro_ok=s_gyro_available && read_turn_raw(sample[0],sample[1],sample[2],&turn)==ESP_OK &&
+        fabsf(turn)<128;
+    sample[3]=gyro_ok?(int16_t)lroundf(turn):0;
+    ok=ok && gyro_ok; // Motion/read errors reject this window; never disable a working gyro.
+#else
+    gyro_ok=s_gyro_available && mpu6500_read_gyro_z(&sample[3])==ESP_OK && abs(sample[3])<655;
+#endif
     if (!ok) { count = 0; gyro_count=0; memset(sums,0,sizeof(sums)); }
     else {
         if (!count) for (int i=0;i<4;i++) { lo[i]=sample[i]; hi[i]=sample[i]; }
@@ -688,6 +739,9 @@ static void calibration_step(bool begin) {
         }
     }
     if (++attempts < 120 && count < 40) return;
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    if(count==40 && ((int)hi[3]-lo[3]>96))count=0;
+#endif
     if (count == 40) {
         s_base_ax=sums[0]/40; s_base_ay=sums[1]/40; s_base_az=sums[2]/40;
         if (s_gyro_available && (gyro_count != 40 || (int)hi[3]-lo[3] > 160)) {
@@ -700,6 +754,10 @@ static void calibration_step(bool begin) {
         s_filtered_roll=0; s_filtered_pitch=0; s_heading_deg=0;
         s_last_sample_us=esp_timer_get_time(); s_read_error=false;
         s_calibration_complete=true;
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+        s_turn_rate=0;s_last_gyro_us=0;s_gyro_read_error=false;
+        display_set_imu_heading(0);
+#endif
         display_set_imu_override_direction(NAV_DIR_NONE);
         ESP_LOGI(TAG,"Calibration accepted: ax=%.0f ay=%.0f az=%.0f",s_base_ax,s_base_ay,s_base_az);
     } else ESP_LOGW(TAG,"Calibration rejected: keep still and retry; valid stationary samples=%d",count);
@@ -741,14 +799,32 @@ static void imu_task(void *pvParam) {
         if (s_gyro_available) {
             // Gyroscope mode: read gz and integrate yaw
             int16_t gz_raw = 0;
-            esp_err_t ret = mpu6500_read_gyro_z(&gz_raw);
+            esp_err_t ret;
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+            float raw=0;
+            ret=read_turn_raw(s_base_ax,s_base_ay,s_base_az,&raw);
+#else
+            ret=mpu6500_read_gyro_z(&gz_raw);
+#endif
             if (ret == ESP_OK) {
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+                // Right-hand positive rotation about "up" is a left turn;
+                // navigation/screen bearings increase clockwise.
+                float gz_dps=-(raw-s_gyro_z_bias)/GYRO_SENSITIVITY_DPS;
+                gz_raw=(int16_t)fmaxf(-32767,fminf(32767,raw));
+#if CONFIG_JR_GYRO_INVERT_TURN
+                gz_dps=-gz_dps;
+#endif
+                s_heading_deg=motion_integrate(s_heading_deg,gz_dps,measured_dt);
+                s_turn_rate=gz_dps;s_last_gyro_us=esp_timer_get_time();s_gyro_read_error=false;
+#else
                 float gz_dps = ((float)gz_raw - s_gyro_z_bias) / GYRO_SENSITIVITY_DPS;
                 if (gz_dps > 0.5f || gz_dps < -0.5f) {
                     s_heading_deg += gz_dps * measured_dt;
                     if (s_heading_deg >= 360.0f) s_heading_deg -= 360.0f;
                     if (s_heading_deg < 0.0f)    s_heading_deg += 360.0f;
                 }
+#endif
                 display_set_imu_heading(s_heading_deg);
 
                 log_counter++;
@@ -758,6 +834,9 @@ static void imu_task(void *pvParam) {
                              gz_raw, gz_dps, s_heading_deg);
                 }
             } else {
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+                s_turn_rate=0;s_gyro_read_error=true;
+#endif
                 vTaskDelay(pdMS_TO_TICKS(50));
             }
         }

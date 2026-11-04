@@ -7,7 +7,7 @@ Use its built-in BLE with the existing JustRide phone app.
 
 ## Screen and behavior
 
-Navigation uses a black background, white phone-projected route, white rider
+Navigation uses a black background, website-green (#34D399) phone-projected route, white rider
 pointer, speed, left/right maneuver arrow, maneuver distance and status.
 The firmware does not generate street tiles or substitute a sample route.
 Waiting for route, GPS loss and phone disconnection remain explicit.
@@ -60,6 +60,60 @@ These connections are already on the PCB; do not wire it as an external 2.8-inch
 One I2C driver owns GPIO47/48. Touch and IMU share complete serialized ESP-IDF
 transactions; the old MPU6500 GPIO21/22 probing/reset routine is excluded on S3.
 QMI8658 samples are decoded little endian with ±2g / ±512dps scales.
+
+### Gyroscope turning
+
+The S3 path projects all three gyro axes onto gravity measured during stationary
+calibration, so turning also works with an upright mounted display. It subtracts
+the measured bias and integrates the clockwise turn at the existing 50 Hz task
+rate. Left/right turn rate and relative yaw are sent to the APK. A read error or
+stale sample stops the pointer from using that reading. Moving calibration windows
+are rejected and retried instead of disabling the gyro. Recalibration resets yaw.
+
+This is relative rotation, not a magnetic compass: drift is possible. GPS and the
+phone still own the route, speed and upcoming maneuver. Keep still during
+calibration. Verify left/right on the actual mounting before riding; menuconfig
+provides `JR_GYRO_INVERT_TURN` if the assembly needs the opposite sign.
+
+### Stock charging hardware and measured voltage
+
+The onboard ETA6098 charges the battery autonomously. Its STAT output drives an
+LED and is **not connected to an ESP32 GPIO**. No extra wire is required by this
+implementation, and it always reports charging/full as **unavailable**.
+
+The schematic's BAT_ADC name is misleading: GPIO4 measures **VCC**, through
+R12=200 kΩ and R17=100 kΩ, so VCC = calibrated ADC voltage × 3. USB power raises
+this rail through the supply diode; it is not battery voltage in that condition.
+The firmware samples once per second, removes the highest/lowest of 16 samples,
+uses the ESP-IDF calibrated ADC conversion and publishes every five seconds.
+Calibration/read failure reports unknown instead of a fabricated voltage.
+`JR_POWER_GAIN_PERMILLE` permits a measured divider correction (default 1000).
+
+The APK shows supply voltage and an explicitly inferred power source. Only a
+battery-range rail receives a rough voltage-based percentage, labelled `~`;
+USB or ambiguous readings have no battery percentage. This is not a fuel gauge,
+and battery load/chemistry affect the estimate. APK readings expire after 15
+seconds without a valid packet and clear on disconnect.
+
+### APK telemetry contract
+
+FF32 capability read is `[1,3,7,9]` on this board: feature bit 4 advertises power
+telemetry, and byte 4 is the ESP image chip ID (9 = ESP32-S3). The original ESP32
+retains `[1,3,3]`. The updated APK selects a separate S3 bundled firmware image
+and rejects a chip-ID mismatch before sending OTA START.
+
+Write `[0x1D,0]` to FF31 to request power. FF32 notifies ten bytes:
+`[1D,1,flags,source,charge,percent,VCClo,VCChi,BATlo,BAThi]`.
+Flags: bit 0 voltage valid, bit 1 battery estimate valid. Source: 0 unknown,
+1 battery inferred, 2 USB inferred. Charge is always 255 (unknown); percent is
+255 when unavailable. Voltage is little-endian millivolts; BAT is zero unless
+estimated on battery power. USB inference starts at 4.45 V and persists down to
+4.35 V; battery inference covers 3.00–4.30 V. Other valid rails remain unknown.
+
+Sensor FF32 v2 is `[1A,2,state,motion,rollLE16,pitchLE16,yawLE16,rateLE16,flags]`.
+Angles and rate are signed tenths of degrees and degrees/second. Gyro flag bit
+0 means available, bit 1 fresh. The old eight-byte v1 remains on the ESP32 path;
+the updated APK parses both. These diagnostic extensions fit the default BLE MTU.
 
 The official V3 demo detects SH8601 with ID 0x86 and CO5300 with ID 0xFF.
 The port uses that procedure and the corresponding vendor startup sequence:
@@ -115,6 +169,8 @@ python tools/test_zoom.py
 The board test compiles the actual QSPI transport and FT3168 driver against mocked
 I/O. It checks both panel offsets, fragmented writes, DMA alignment, dirty-row
 suppression, image-pane mapping, touch release and I2C failure handling.
+It also checks stock divider conversion, USB/unknown behavior, monotonic battery
+estimates, exact power packets and gravity-projected turning/integration/wrap.
 The preview tool checks round hitbox mapping, FT3168 reports, QMI8658 signed
 samples, splash animation boundaries and changing maneuver output.
 The existing touch suite checks 392 driver/gesture cases.

@@ -14,6 +14,7 @@ headers={
 'string.h':'#include <stddef.h>\nvoid *memcpy(void*,const void*,size_t);void *memset(void*,int,size_t);int memcmp(const void*,const void*,size_t);',
 'stdlib.h':'void abort(void);',
 'assert.h':'#include <stdlib.h>\n#define assert(x) ((x)?(void)0:abort())',
+'math.h':'float sqrtf(float);double fabs(double);int _finite(double);\n#define fabsf(x) ((float)fabs(x))\n#define isfinite(x) _finite(x)',
 'esp_err.h':'typedef int esp_err_t;\n#define ESP_OK 0\n#define ESP_ERR_NO_MEM 1\n#define ESP_ERR_NOT_SUPPORTED 2\n#define ESP_ERR_INVALID_STATE 3\n#define ESP_FAIL 4\n#define ESP_ERR_INVALID_RESPONSE 5\nconst char *esp_err_to_name(int e);',
 'esp_log.h':'#define ESP_LOGI(...) ((void)0)\n#define ESP_LOGE(...) ((void)0)',
 'esp_check.h':'#define ESP_RETURN_ON_ERROR(e,tag,msg) do{int err=(e);if(err)return err;}while(0)',
@@ -60,6 +61,9 @@ fixture=r'''
 #include <string.h>
 #include "host_display.h"
 #include "waveshare143.h"
+#include "power_math.h"
+#include "motion_math.h"
+int _fltused;
 #include "round_panel.c"
 #include "touch_ft3168.c"
 static uint8_t storage[466*466*2],gram[466*466*2],id_value=0x86;
@@ -131,6 +135,35 @@ __declspec(dllexport) int run_board_checks(void){
   assert(storage[(101*466+57)*2]==0xff); // legacy pane origin
   assert(storage[0]==0); // unused round margins stay black
  }
+ // Stock board power: ADC = VCC/3, USB must never imply charging or a full battery.
+ device_power_t p=power_measurement(1250,1000,0);
+ assert(p.valid && p.rail_mv==3750 && p.battery_mv==3750 && p.percent==50 && p.source==1);
+ uint8_t packet[10];power_encode(p,packet);
+ assert(!memcmp(packet,(uint8_t[]){0x1d,1,3,1,255,50,0xa6,0x0e,0xa6,0x0e},10));
+ p=power_measurement(1567,1000,1);power_encode(p,packet);
+ assert(p.valid && p.source==2 && p.rail_mv==4701 && p.battery_mv==0 && p.percent==255);
+ assert(!memcmp(packet,(uint8_t[]){0x1d,1,1,2,255,255,0x5d,0x12,0,0},10));
+ assert(power_measurement(1460,1000,2).source==2); // USB hysteresis.
+ assert(power_measurement(1460,1000,0).source==0); // Ambiguous supply.
+ assert(power_measurement(1400,1000,2).source==1);
+ for(int bad=0;bad<=2;bad++) {
+   p=power_measurement((int[]){0,800,2000}[bad],1000,2);power_encode(p,packet);
+   assert(!p.valid && !memcmp(packet,(uint8_t[]){0x1d,1,0,0,255,255,0,0,0,0},10));
+ }
+ assert(power_percent(3200)==0 && power_percent(4200)==100);
+ for(int mv=3001;mv<=4300;mv++)assert(power_percent(mv)>=power_percent(mv-1));
+ assert(power_measurement(1250,1020,0).rail_mv==3825);
+ // Gravity projection supports flat and upright mounting and rejects pitch-only rotation.
+ int16_t gyro[3]={0,0,640};
+ assert(motion_turn_raw(gyro,0,0,16384)==640);
+ assert(motion_turn_raw(gyro,0,16384,0)==0);
+ gyro[1]=640;gyro[2]=0;assert(motion_turn_raw(gyro,0,16384,0)==640);
+ assert(motion_turn_raw(gyro,0,-16384,0)==-640);
+ assert(motion_turn_raw(gyro,0,0,0)==0);
+ assert(motion_integrate(0,-10,0.1f)==-1 && motion_integrate(0,10,0.1f)==1);
+ assert(motion_integrate(179,20,0.1f)==-179 && motion_integrate(-179,-20,0.1f)==179);
+ assert(motion_integrate(4,0.4f,0.1f)==4 && motion_integrate(4,100,1)==4);
+ assert(motion_integrate(4,100,0)==4 && motion_integrate(4,100,-1)==4);
  assert(touch_init()==0);
  touch_point_t point={.is_pressed=true};
  memcpy(touch_report,(uint8_t[]){1,0x80,233,0,250},5);
@@ -143,10 +176,10 @@ __declspec(dllexport) int run_board_checks(void){
 }
 '''
 (OUT/'fixture.c').write_text(fixture)
-(OUT/'ucrt.def').write_text('LIBRARY ucrtbase.dll\nEXPORTS\nmemcpy\nmemset\nmemcmp\nabort\n')
+(OUT/'ucrt.def').write_text('LIBRARY ucrtbase.dll\nEXPORTS\nmemcpy\nmemset\nmemcmp\nabort\nsqrtf\nfabs\n_finite\n')
 compiler=sorted(Path('C:/Program Files (x86)/Microsoft Visual Studio').glob('*/BuildTools/VC/Tools/MSVC/*/bin/Hostx64/x64/cl.exe'))[-1]
 env=dict(os.environ,PATH=str(compiler.parent)+os.pathsep+os.environ['PATH'])
 subprocess.run([str(compiler.parent/'lib.exe'),'/nologo','/def:ucrt.def','/machine:x64','/out:ucrt.lib'],cwd=OUT,env=env,check=True)
 subprocess.run([str(compiler),'/nologo','/std:c11','/GS-','/Zl','/LD','/Iinclude',f'/I{ROOT}/main/display',f'/I{ROOT}/main/board','fixture.c','/Feboard.dll','/link','/noentry','/nodefaultlib','ucrt.lib'],cwd=OUT,env=env,check=True)
 dll=ctypes.CDLL(str(OUT/'board.dll'));assert dll.run_board_checks()==0
-print('Actual QSPI transport (SH8601/CO5300 offsets, chunking, aligned DMA, dirty rows) and FT3168 driver checks passed.')
+print('QSPI transport, FT3168, power voltage/source/packets, and gravity-projected turn integration checks passed.')

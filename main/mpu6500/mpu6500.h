@@ -85,6 +85,7 @@ typedef enum {
  * @return ESP_OK on success.
  */
 esp_err_t mpu6500_init(void);
+bool mpu6500_turn_fresh(void);
 
 /**
  * @brief Launch the FreeRTOS task at 50 Hz that samples the sensor,

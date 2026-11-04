@@ -11,8 +11,8 @@
 #define JR_PANEL_ALT    JR_RGB565(0x151515)
 #define JR_TEXT         0xFFFF
 #define JR_MUTED        JR_RGB565(0xB8B8B8)
-#define JR_PRIMARY      0xFFFF
-#define JR_PRIMARY_DARK JR_RGB565(0x555555)
+#define JR_PRIMARY      JR_RGB565(0x34d399)
+#define JR_PRIMARY_DARK JR_RGB565(0x087c59)
 #else
 #define JR_BG           JR_RGB565(0x0b100d)
 #define JR_PANEL        JR_RGB565(0x141a16)

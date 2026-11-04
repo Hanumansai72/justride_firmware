@@ -28,6 +28,7 @@
 #include "ota.h"
 #include "display.h"
 #include "mpu6500.h"
+#include "device_power.h"
 
 static const char *TAG = "BLE";
 
@@ -589,6 +590,10 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
         char caller[48]={0};memcpy(caller,rx_buf+4,rx_buf[3]);
         display_update_call(rx_buf[1],rx_buf[2],caller);return 0;
     }
+    if(rx_buf[0]==0x1d) {
+        if(len!=2 || rx_buf[1]!=0)return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        device_power_publish();return 0;
+    }
     if (rx_buf[0] == 0x1A) {
         if (len != 2 || rx_buf[1] > 1) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
         if (rx_buf[1] == 1 && !mpu6500_request_calibration()) {
@@ -967,7 +972,11 @@ static int ble_nav_status_access(uint16_t conn_handle, uint16_t attr_handle,
                                  struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
-        uint8_t status_buf[3] = { 0x01, 0x03, 0x03 }; // Sensor and raster HUD
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+        uint8_t status_buf[4] = {1,3,7,9}; // Power telemetry; ESP image chip ID 9 = S3.
+#else
+        uint8_t status_buf[3] = {1,3,3}; // Original ESP32 protocol remains unchanged.
+#endif
         os_mbuf_append(ctxt->om, status_buf, sizeof(status_buf));
         return 0;
     }

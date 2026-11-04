@@ -4,6 +4,12 @@ config JUSTRIDE_ROUND_AMOLED
     default y
     depends on IDF_TARGET_ESP32S3
 if JUSTRIDE_ROUND_AMOLED
+config JR_POWER_GAIN_PERMILLE
+    int "Supply-voltage divider correction (1000 = nominal 200k/100k)"
+    range 900 1100
+    default 1000
+config JR_GYRO_INVERT_TURN
+    bool "Invert gyroscope turn direction for mounting"
 choice JR_PANEL_MODEL
     prompt "AMOLED panel variant"
     default JR_PANEL_AUTO

@@ -782,6 +782,10 @@ static void draw_hud_rider_chevron(float angle_rad) {
 static float rider_motion_degrees(void) {
   if(!mpu6500_is_available() || !mpu6500_is_calibration_complete())return 0;
   if(mpu6500_is_gyro_available()) {
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    if(!mpu6500_turn_fresh())return 0;
+    return mpu6500_get_heading_deg();
+#endif
     float angle=mpu6500_get_heading_deg()-s_imu_ref_heading;
     if(angle>180)angle-=360;
     if(angle< -180)angle+=360;
