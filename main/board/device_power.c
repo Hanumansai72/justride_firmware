@@ -5,6 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #if CONFIG_JUSTRIDE_ROUND_AMOLED
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
@@ -13,9 +14,11 @@ static adc_oneshot_unit_handle_t adc;
 static adc_cali_handle_t calibration;
 static portMUX_TYPE power_lock=portMUX_INITIALIZER_UNLOCKED;
 static device_power_t latest={.percent=255};
+static int64_t sampled_at;
 device_power_t device_power_snapshot(void) {
     portENTER_CRITICAL(&power_lock);
     device_power_t p=latest;
+    if(!sampled_at || esp_timer_get_time()-sampled_at>3000000)p=(device_power_t){.percent=255};
     portEXIT_CRITICAL(&power_lock);return p;
 }
 static void power_task(void *unused) {
@@ -32,7 +35,7 @@ static void power_task(void *unused) {
         if(ok)ok=adc_cali_raw_to_voltage(calibration,(sum-minimum-maximum)/14,&mv)==ESP_OK;
         device_power_t p=power_measurement(ok?mv:0,CONFIG_JR_POWER_GAIN_PERMILLE,
             device_power_snapshot().source);
-        portENTER_CRITICAL(&power_lock);latest=p;portEXIT_CRITICAL(&power_lock);
+        portENTER_CRITICAL(&power_lock);latest=p;sampled_at=esp_timer_get_time();portEXIT_CRITICAL(&power_lock);
         if(power_warning_update(&warning,p)) {
             display_show_app_notification("JustRide","LOW BATTERY","Battery estimate below 15%. Charge soon.");
         }

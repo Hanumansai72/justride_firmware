@@ -18,7 +18,7 @@ coordinates are mapped through the same transform.
 
 ### Riding experience
 
-- Within 100 m of a left/right maneuver, three medium **green chevrons on the left**
+- Within 15 m of a left/right maneuver, three medium **green chevrons on the left**
   use the supplied reference silhouette. Right-turn chevrons mirror inside that
   same left-side area. They blink 500 ms on / 500 ms off. The route and white rider
   pointer remain visible in both phases; no large black rectangle covers the map.
@@ -152,10 +152,17 @@ seconds without a valid packet and clear on disconnect.
 
 ### APK telemetry contract
 
-FF32 capability read is `[1,3,7,9]` on this board: feature bit 4 advertises power
-telemetry, and byte 4 is the ESP image chip ID (9 = ESP32-S3). The original ESP32
+FF32 capability read begins `[1,4,7,9,securityFlags]` on this board, followed by a
+32-byte zero-terminated firmware version. Bit 0 of securityFlags means native
+signed-image OTA is required. Feature bit 4 advertises power telemetry; the fourth
+byte is the ESP image chip ID (9 = ESP32-S3). The original ESP32
 retains `[1,3,3]`. The updated APK selects a separate S3 bundled firmware image
 and rejects a chip-ID mismatch before sending OTA START.
+
+Protocol v4 adds FF31 `[1E,glove,autoBrightness,manualPercent]` and revision-wrapped
+`[1F,length,UTF8destination]` (at most 31 bytes). Manual brightness emits FF32
+`[20,percent]` and disables the schedule. Next maneuver uses the existing fields.
+See [rider features, signed installation and remaining limits](RIDER_FEATURES.md).
 
 Write `[0x1D,0]` to FF31 to request power. FF32 notifies ten bytes:
 `[1D,1,flags,source,charge,percent,VCClo,VCChi,BATlo,BAThi]`.

@@ -13,6 +13,8 @@ extern "C" {
  *        Starts the NimBLE FreeRTOS host task and registers the sync callback.
  */
 void ble_init(void);
+void ble_process_ota(void);
+bool ble_startup_healthy(void);
 
 /**
  * @brief Start fast BLE advertising with the device name "JUSTRIDE".

@@ -201,6 +201,14 @@ static void draw_nav(void *context) {
     } else if(v->battery_low) {
         snprintf(value,sizeof(value),"LOW BATTERY ~%u%%",v->battery_percent);
         text(160,24,value,10,GREEN);
+    } else if(v->destination[0]) {
+        text(160,24,v->destination,10,GREEN);
+    }
+    if(ride_sharp_warning(m->direction,v->maneuver_state,m->distance_m,m->speed,v->recovery))
+        text(160,108,m->direction==6?"! SHARP LEFT":"! SHARP RIGHT",12,GREEN);
+    else if(live && v->next_direction) {
+        snprintf(value,sizeof(value),"Then %s",action(v->next_direction));
+        text(160,108,value,10,MUTED);
     }
     if(m->speed_limit) {
         snprintf(value,sizeof(value),"LIMIT %u",m->speed_limit);
@@ -282,6 +290,8 @@ static void skip(int cx,int cy,bool next,uint16_t color) {
     int s=next?1:-1;tft_fill_triangle(cx-s*10,cy-11,cx+s*7,cy,cx-s*10,cy+11,color);
     tft_fill_rect(cx+s*10-2,cy-12,4,24,color);
 }
+static bool glove_mode;
+void round_ui_set_glove_mode(bool enabled){glove_mode=enabled;}
 static void draw_music(void *context) {
     const music_t *m=context;
     text(160,43,"NOW PLAYING",16,GREEN);
@@ -293,11 +303,11 @@ static void draw_music(void *context) {
     uint16_t next=m->active&&(m->actions&4)?WHITE:JR_BORDER;
     uint16_t play=m->active&&(m->actions&(m->playing?2:1))?GREEN:JR_BORDER;
     skip(80,226,false,previous);skip(240,226,true,next);
-    tft_fill_circle(160,226,33,play);
+    tft_fill_circle(160,226,glove_mode?39:33,play);
     if(m->playing){tft_fill_round_rect(148,214,7,25,3,BLACK);tft_fill_round_rect(166,214,7,25,3,BLACK);}
     else tft_fill_triangle(152,211,152,241,174,226,BLACK);
-    text(118,278,"-",16,m->active&&(m->actions&16)?WHITE:JR_BORDER);
-    text(202,278,"+",16,m->active&&(m->actions&16)?WHITE:JR_BORDER);
+    text(118,278,"-",glove_mode?24:16,m->active&&(m->actions&16)?WHITE:JR_BORDER);
+    text(202,278,"+",glove_mode?24:16,m->active&&(m->actions&16)?WHITE:JR_BORDER);
 }
 void round_ui_music(const char *title,const char *artist,const char *status,bool playing,uint8_t actions,bool active) {
     music_t m={title,artist,status,playing,active,actions};
@@ -310,7 +320,7 @@ static void draw_call(void *context) {
     text(160,165,c->connected?"Phone call":"Phone disconnected",12,MUTED);
     uint16_t decline=c->connected&&(c->actions&2)?0xE800:JR_BORDER;
     uint16_t accept=c->connected&&(c->actions&1)?0x05E0:JR_BORDER;
-    tft_fill_circle(111,235,27,decline);tft_fill_circle(209,235,27,accept);
+    tft_fill_circle(111,235,glove_mode?35:27,decline);tft_fill_circle(209,235,glove_mode?35:27,accept);
     // Horizontal handset for decline; slanted handset for accept.
     tft_draw_arc(111,240,15,10,210,330,WHITE);
     tft_fill_round_rect(97,231,6,9,2,WHITE);tft_fill_round_rect(119,231,6,9,2,WHITE);

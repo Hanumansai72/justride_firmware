@@ -13,6 +13,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_partition.h"
+#include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
@@ -31,6 +32,39 @@ static SemaphoreHandle_t s_display_mutex = NULL;
 
 // Dynamic brightness state (0-100%)
 static uint8_t s_brightness_pct = 80;
+static volatile bool s_glove_mode;
+static volatile bool s_auto_brightness;
+static volatile uint8_t s_manual_brightness=80;
+static volatile unsigned s_options_revision;
+static volatile uint32_t s_render_heartbeat;
+static volatile bool s_ride_active;
+bool display_ride_active(void){return s_ride_active;}
+bool display_startup_healthy(void) {
+  return s_is_initialized && s_render_heartbeat && (uint32_t)(esp_timer_get_time()/1000)-s_render_heartbeat<2000;
+}
+static volatile bool s_options_pending;
+void display_set_glove_mode(bool enabled){if(s_glove_mode!=enabled){s_glove_mode=enabled;s_options_revision++;}}
+void display_configure_rider_options(bool glove,bool automatic,uint8_t manual) {
+  if(manual>100)return;
+  display_set_glove_mode(glove);
+  if(s_auto_brightness!=automatic || s_manual_brightness!=manual) {
+    s_auto_brightness=automatic;s_manual_brightness=manual;
+    s_options_pending=true;s_options_revision++;
+  }
+}
+void display_save_preferences(void) {
+  static unsigned saved_revision;
+  unsigned revision=s_options_revision;
+  if(revision==saved_revision)return;
+  nvs_handle_t handle;
+  if(nvs_open("rider",NVS_READWRITE,&handle)!=ESP_OK)return;
+  esp_err_t e=nvs_set_u8(handle,"glove",s_glove_mode);
+  if(e==ESP_OK)e=nvs_set_u8(handle,"auto",s_auto_brightness);
+  if(e==ESP_OK)e=nvs_set_u8(handle,"manual",s_manual_brightness);
+  if(e==ESP_OK)e=nvs_commit(handle);
+  nvs_close(handle);
+  if(e==ESP_OK)saved_revision=revision;
+}
 
 // Dynamic system state
 static uint8_t s_time_hours = 14;
@@ -50,6 +84,14 @@ static bool s_call_painted;
 static QueueHandle_t s_call_queue;
 static StaticQueue_t s_call_queue_storage;
 static uint8_t s_call_queue_bytes[sizeof(call_info_t)];
+static char s_destination[32];
+static QueueHandle_t s_destination_queue;
+static StaticQueue_t s_destination_queue_storage;
+static uint8_t s_destination_queue_bytes[32];
+void display_set_destination(const char *name) {
+  char label[32]={0};snprintf(label,sizeof(label),"%s",name?name:"");
+  if(s_destination_queue)xQueueOverwrite(s_destination_queue,label);
+}
 void display_update_call(uint8_t state,uint8_t actions,const char *caller) {
   if(!s_call_queue)return;
   call_info_t call={.state=state,.actions=actions};
@@ -1027,6 +1069,7 @@ static void display_nav_render_partial(void) {
   static uint32_t map_serial,marker_serial;
   static int last_tilt;
   static uint8_t last_recovery,last_battery;
+  static uint8_t last_maneuver_state,last_next_direction;
   static bool last_blink;
   static bool last_trip_valid;
   static char last_arrival_time[8];
@@ -1042,7 +1085,8 @@ static void display_nav_render_partial(void) {
   if(first || s_route_seg_dirty || memcmp(&model,&s_last_hud,sizeof(model)) ||
       map_serial!=map_frame_paint_serial() || marker_serial!=map_frame_marker_serial() ||
       tilt!=last_tilt || s_notif_dirty || recovery!=last_recovery || blink!=last_blink || battery!=last_battery ||
-      last_trip_valid!=s_nav.trip_data_valid || strcmp(last_arrival_time,s_arrival_time)) {
+      last_trip_valid!=s_nav.trip_data_valid || strcmp(last_arrival_time,s_arrival_time) ||
+      last_maneuver_state!=s_nav.maneuver_state || last_next_direction!=s_nav.next_direction) {
     round_route_point_t points[ROUTE_MAX_POINTS];
     for(unsigned i=0;i<s_route_seg.count;i++){points[i].x=s_route_seg.points[i].x;points[i].y=s_route_seg.points[i].y;}
     round_nav_t view={.nav=model,.points=points,.count=s_route_seg.count,
@@ -1050,10 +1094,13 @@ static void display_nav_render_partial(void) {
         .overview=s_route_seg.overview,.recovery=recovery,.maneuver_state=s_nav.maneuver_state,
         .blink_on=blink,.battery_low=battery_low,.battery_percent=power.percent,.trip_valid=s_nav.trip_data_valid};
     snprintf(view.arrival_time,sizeof(view.arrival_time),"%s",s_arrival_time);
+    snprintf(view.destination,sizeof(view.destination),"%s",s_destination);
+    view.next_direction=s_nav.next_direction;
     round_ui_navigation(&view);
     map_serial=map_frame_paint_serial();marker_serial=map_frame_marker_serial();last_tilt=tilt;
     last_recovery=recovery;last_blink=blink;last_battery=battery;
     last_trip_valid=s_nav.trip_data_valid;
+    last_maneuver_state=s_nav.maneuver_state;last_next_direction=s_nav.next_direction;
     snprintf(last_arrival_time,sizeof(last_arrival_time),"%s",s_arrival_time);
     s_last_hud=model;s_hud.is_frame_active=true;s_route_seg_dirty=false;
     s_notif_dirty=false;
@@ -1467,7 +1514,6 @@ void display_show_brightness_screen(void) {
 // SCREEN 5: OTA UPDATING SCREEN (Preserved)
 // =============================================================================
 void display_show_ota_screen(uint8_t progress_pct) {
-  tft_set_round_canvas(false);
   if (!s_is_initialized)
     display_init();
   if (progress_pct > 100)
@@ -1482,6 +1528,7 @@ void display_show_ota_screen(uint8_t progress_pct) {
   if (s_display_mutex) {
     xSemaphoreTakeRecursive(s_display_mutex, portMAX_DELAY);
   }
+  tft_set_round_canvas(false);
 
   bool first_draw = (s_current_screen != SCREEN_OTA);
   s_current_screen = SCREEN_OTA;
@@ -1713,8 +1760,8 @@ static void handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x,
 
   if(s_call.state==1) {
 #if CONFIG_JUSTRIDE_ROUND_AMOLED
-    if(gesture==TOUCH_GESTURE_TAP && s_ble_connected && start_y>=201 && start_y<=269) {
-      uint8_t action=start_x>=77 && start_x<=145?2:start_x>=175 && start_x<=243?1:0;
+    if(gesture==TOUCH_GESTURE_TAP && s_ble_connected) {
+      uint8_t action=ride_call_action(s_glove_mode,start_x,start_y);
       if(action && (s_call.actions & (1<<(action-1)))) {
         uint8_t packet[2]={0x1C,action};ble_nav_notify_diagnostic_packet(packet,sizeof(packet));
       }
@@ -1848,13 +1895,13 @@ static void handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x,
       uint8_t command=0,action=0;
       if(s_media.state<3 || s_media.state>5) {
         if(ty>=190 && ty<=263)command=s_media.state==1?8:7;
-      } else if(ty>=190 && ty<=263) {
-        if(tx>=48 && tx<=112){command=4;action=8;}
-        else if(tx>=125 && tx<=195){command=s_media.state==4?2:1;action=command;}
-        else if(tx>=208 && tx<=272){command=3;action=4;}
+      } else if(ty>=(s_glove_mode?184:190) && ty<=263) {
+        if(tx>=(s_glove_mode?38:48) && tx<=112){command=4;action=8;}
+        else if(tx>=(s_glove_mode?120:125) && tx<=(s_glove_mode?200:195)){command=s_media.state==4?2:1;action=command;}
+        else if(tx>=208 && tx<=(s_glove_mode?282:272)){command=3;action=4;}
       } else if(ty>=268 && ty<=310) {
-        if(tx>=92 && tx<=144){command=6;action=16;}
-        else if(tx>=176 && tx<=228){command=5;action=16;}
+        if(tx>=(s_glove_mode?80:92) && tx<=(s_glove_mode?150:144)){command=6;action=16;}
+        else if(tx>=(s_glove_mode?170:176) && tx<=(s_glove_mode?240:228)){command=5;action=16;}
       }
       int64_t now=esp_timer_get_time();
       if(command && (!action || (s_media.actions&action)) && now-s_last_media_command_us>=250000) {
@@ -2124,6 +2171,8 @@ void display_set_brightness(uint8_t brightness_pct) {
   if (brightness_pct > 100)
     brightness_pct = 100;
   s_brightness_pct = brightness_pct;
+  s_auto_brightness=false;s_manual_brightness=brightness_pct;s_options_revision++;
+  uint8_t packet[]={0x20,brightness_pct};ble_nav_notify_diagnostic_packet(packet,sizeof(packet));
   tft_set_backlight(s_brightness_pct);
   if (s_is_initialized && s_current_screen == SCREEN_SETTINGS) {
     update_brightness_widgets();
@@ -2153,6 +2202,28 @@ static void nav_render_task(void *pvParam) {
         display_dismiss_notification();
       }
       int64_t started = esp_timer_get_time();
+      s_render_heartbeat=(uint32_t)(started/1000);
+      s_ride_active=s_nav.is_navigating;
+      if(s_options_pending || (s_auto_brightness && time_is_synchronized())) {
+        s_options_pending=false;
+        uint8_t target=s_auto_brightness && time_is_synchronized()?ride_scheduled_brightness(s_time_hours):s_manual_brightness;
+        if(target!=s_brightness_pct) {
+          s_brightness_pct=target;
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+          if(!s_panel_asleep)tft_set_backlight(target);
+#else
+          tft_set_backlight(target);
+#endif
+        }
+      }
+      static bool glove_mode;
+      if(glove_mode!=s_glove_mode) {
+        glove_mode=s_glove_mode;
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+        round_ui_set_glove_mode(glove_mode);
+#endif
+        s_call_painted=false;s_media_dirty=true;
+      }
       if (s_image_refresh_requested && s_call.state!=1) {
         s_image_refresh_requested = false;
         if (s_current_screen == SCREEN_PICTURE) display_show_user_image();
@@ -2177,6 +2248,7 @@ static void nav_render_task(void *pvParam) {
       if (xQueueReceive(s_notification_queue, &notification, 0) == pdTRUE)
         apply_notification(&notification);
       navigation_data_t nav;
+      if(xQueueReceive(s_destination_queue,s_destination,0)==pdTRUE)s_notif_dirty=true;
       if (xQueueReceive(s_nav_queue, &nav, 0) == pdTRUE) apply_navigation(&nav);
       route_segment_t segment;
       if (xQueueReceive(s_route_queue, &segment, 0) == pdTRUE && s_nav.is_navigating &&
@@ -2272,12 +2344,20 @@ static void nav_render_task(void *pvParam) {
 void display_init(void) {
   if (s_is_initialized)
     return;
+  nvs_handle_t preferences;
+  if(nvs_open("rider",NVS_READONLY,&preferences)==ESP_OK) {
+    uint8_t glove=0,automatic=0,manual=80;
+    nvs_get_u8(preferences,"glove",&glove);nvs_get_u8(preferences,"auto",&automatic);
+    nvs_get_u8(preferences,"manual",&manual);nvs_close(preferences);
+    if(glove<=1 && automatic<=1 && manual<=100)display_configure_rider_options(glove,automatic,manual);
+  }
 
   if (!s_display_mutex) {
     s_display_mutex = xSemaphoreCreateRecursiveMutex();
   }
 
   s_call_queue=xQueueCreateStatic(1,sizeof(call_info_t),s_call_queue_bytes,&s_call_queue_storage);
+  s_destination_queue=xQueueCreateStatic(1,32,s_destination_queue_bytes,&s_destination_queue_storage);
   s_nav_queue = xQueueCreateStatic(1, sizeof(navigation_data_t), s_nav_queue_bytes, &s_nav_queue_storage);
   s_media_queue = xQueueCreateStatic(1, sizeof(media_state_t), s_media_queue_bytes, &s_media_queue_storage);
   s_route_queue = xQueueCreateStatic(1, sizeof(route_segment_t), s_route_queue_bytes, &s_route_queue_storage);
@@ -2285,7 +2365,7 @@ void display_init(void) {
   s_connection_queue = xQueueCreateStatic(1, sizeof(bool), s_connection_queue_bytes, &s_connection_queue_storage);
   s_notification_queue = xQueueCreateStatic(1, sizeof(notification_info_t), s_notification_queue_bytes, &s_notification_queue_storage);
   configASSERT(s_display_mutex && s_nav_queue && s_media_queue && s_route_queue &&
-      s_context_queue && s_connection_queue && s_notification_queue && s_call_queue);
+      s_context_queue && s_connection_queue && s_notification_queue && s_call_queue && s_destination_queue);
   ESP_ERROR_CHECK(tft_init());
   ESP_ERROR_CHECK(touch_init());
 

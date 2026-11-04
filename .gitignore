@@ -13,3 +13,5 @@ sdkconfig.*
 *.elf
 *.map
 *.log
+*.pem
+*.key

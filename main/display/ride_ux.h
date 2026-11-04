@@ -18,6 +18,20 @@ static inline int ride_turn_side(uint8_t direction) {
 }
 static inline bool ride_turn_alert(uint8_t direction,uint8_t maneuver_state,
                                    uint32_t distance,uint8_t recovery) {
-    return recovery==RIDE_LIVE && maneuver_state!=5 && ride_turn_side(direction) && distance<=100;
+    return recovery==RIDE_LIVE && maneuver_state!=5 && ride_turn_side(direction) && distance<=15;
 }
 static inline bool ride_blink_on(int64_t now_us){return (now_us/500000)%2==0;}
+static inline bool ride_sharp_warning(uint8_t direction,uint8_t state,uint32_t distance,
+                                      unsigned speed,uint8_t recovery) {
+    unsigned threshold=speed*6/3.6f;
+    if(threshold<50)threshold=50;
+    if(threshold>200)threshold=200;
+    return recovery==RIDE_LIVE && state!=5 && (direction==6 || direction==7) && distance<=threshold;
+}
+static inline uint8_t ride_scheduled_brightness(unsigned hour){return hour>=7 && hour<19?85:35;}
+static inline uint8_t ride_call_action(bool glove,int x,int y) {
+    if(y<(glove?190:201) || y>(glove?280:269))return 0;
+    if(x>=(glove?67:77) && x<=(glove?150:145))return 2;
+    if(x>=(glove?170:175) && x<=(glove?253:243))return 1;
+    return 0;
+}

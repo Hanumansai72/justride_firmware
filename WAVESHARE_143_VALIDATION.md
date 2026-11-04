@@ -1,70 +1,49 @@
 # Verification — 4 November 2026
 
-Software verification passed before pushing this branch.
-
 | Check | Result |
 |---|---|
-| ESP-IDF 5.5.5 / ESP32-S3 build | Pass; application 822,256 bytes, 54% OTA-slot space free |
-| ESP-IDF 5.5.5 / original ESP32 2.8-inch build | Pass; application 769,328 bytes, 57% OTA-slot space free |
-| Actual QSPI transport with mocked SPI/GPIO | Pass for SH8601 and CO5300 IDs/offsets, fragmented writes, even-row DMA and unchanged-row suppression |
-| Actual FT3168 driver with mocked I2C | Pass for contact mapping, release and read failure |
-| Round C renderer and geometry | Pass; all preview screens generated from the production functions |
-| XPT2046/gesture/wake suite | Pass; 101 checks × four rotations, 404 total |
-| Existing map receiver and camera bounds | Pass |
-| Application compiler checks | Pass; all application sources cross-compiled by ESP-IDF |
-| Git whitespace check | Pass |
-| Power/turn math and wire format | Pass; VCC ×3, USB hysteresis, unknown charge/percentage, golden packets, monotonic estimate, upright/flat turn projection and signed wrap |
-| Updated APK focused analysis | Pass with informational style lints; no errors or warnings in changed files |
-| APK power/gyro, turn vibration, GPS freshness, pause flag, navigation packets, OTA chip guard, touch zoom and clock tests | Pass; 32 tests |
-| Android release APK | Pass; Flutter `build apk --release --no-pub`, approximately 59 MB |
-| Display standby policy | Pass; exact 15-second boundary, touch reset, busy wake and re-idle |
-| Both panel standby transports | Pass with mocked I/O; 0x28/0x29, duplicate suppression, no asleep pixel writes, full frame/brightness restore |
-| Raw-contact wake handling | Pass; first held touch is consumed, one isolated failed/release sample is tolerated, next separate tap works, outside-pane FT3168 contact is retained |
-| App maneuver gap diagnostics | Four reproductions passed, confirming current ramp/U-turn/roundabout/parallel-road limitations; see NAVIGATION_GAPS.md |
-| Rerouting pipeline | Three actual NavigationService tests with mocked GPS/routes passed: failed request retains warning and backs off before success, returning to the old route clears the warning, late response after Stop is ignored |
-| App regression run | 41 tests passed, including the four existing gap diagnostics; three rerouting integration tests passed separately |
+| ESP-IDF 5.5.5 / Waveshare signed-update profile | Pass; unsigned/padded application 851,968 bytes; signed image 856,064 bytes of the unchanged 1,769,472-byte OTA slot (about 52% free) |
+| Original ESP32 2.8-inch profile | Pass; retained 4 MB target compiles independently |
+| Signature tooling | Native ESP-IDF verification accepts the signed image, rejects wrong-key, modified and truncated images |
+| Firmware host checks | Pass: actual QSPI/FT3168 mocked I/O, power/motion, 15 m vs 16 m blink boundary, warning completion/stale suppression, day/night boundaries and larger call hit regions |
+| Touch/wake driver suite | Pass: 101 checks × four rotations, 404 total |
+| Map receiver/camera bounds | Pass |
+| Round renderer | Production C captures; blink changes only left overlay bounds; blink-off preserves map and white pointer |
+| Focused companion-app regression set | 49 tests passed, including multi-stop edits/skip, failed next-leg retention, confirmed intermediate arrival, late responses, history/trail persistence, power guards and existing navigation/BLE/clock/zoom checks |
+| Changed app code analysis | No errors or warnings; informational style lints remain |
 
-The companion APK source is in the separate MobileApp checkout; no private app
-source is published in this firmware repository. Its power card was widget-tested
-for live battery/USB changes and disconnect clearing. This is mocked telemetry,
-not a physical BLE session. The APK includes a separate S3 firmware asset and
-refuses OTA images for the wrong ESP chip.
+The included private companion-app source remains in its separate checkout and is
+not published in this public firmware repository. Release packaging verifies that
+its S3 asset matches the signed USB application, while its separate original ESP32
+asset stays intact. The APK retains the project's prototype/debug signing key.
 
-The round preview fixture checks that the medium left overlay changes only its
-small bounds, and that blink off matches a normal frame exactly, preserving the
-route, pointer, speed, maneuver distance and trip footer. Both
-directions are captured on/off, with 466×466 two-frame GIFs (500 ms per frame).
-Recovery tests cover five-second packet expiry, disconnect, sync, weak GPS,
-rerouting, pause and automatic return to live state. Turn alerts are suppressed
-in every recovery state and after maneuver completion. Power warning tests cover
-five stable low samples, one-shot notification, hysteresis and invalid/USB readings.
-APK tests mock native haptics to verify opt-in, one alert per maneuver and no alert
-for an old fix. The wire-level pause bit is checked for update and sync packets.
+The broader pre-existing app suite is not clean: speed_filter_test.dart references
+missing SpeedFilter.toKmh, and ui_cleanup_test.dart depends on unsupported desktop
+Bluetooth plus outdated settling/image expectations. Those unrelated tests were
+left intact. No CodeRabbit review is claimed.
 
-The wider existing app suite is not clean: `speed_filter_test.dart` calls a missing
-`SpeedFilter.toKmh`; the optional `ui_cleanup_test.dart` run failed on unsupported
-desktop Bluetooth, navigation settling and an outdated `.webp` asset expectation
-(the current product image is `.png`). Those unrelated tests were left intact.
-CodeRabbit was unavailable on this Windows host; automatic approval review also
-rejected its remote installer. No CodeRabbit review is claimed.
+## Memory and performance
 
-The S3 build uses 16 MB flash and 8 MB octal PSRAM. The retained ESP32 build uses
-4 MB flash and excludes the Waveshare touch/IMU/panel paths.
-Neither profile exceeds its original 0x1B0000-byte application OTA slot.
-The original 2.8-inch working checkout remains on version-2.0.
+The unsigned application grew from 822,256 bytes to 851,968 bytes; signing adds
+one 4,096-byte sector. Final signed growth is 33,808 bytes (about 4.1%).
+ELF reported static D/IRAM is 149,191 bytes, with .data 42,054 and .bss 10,000;
+these section values are not runtime free heap. Actual runtime memory/latency
+before/after was not measured because no board is attached.
 
-The first full local build encountered an internal compiler error in an unused
-ESP-IDF RGB driver. The project now builds its declared component graph from
-`main` rather than every installed optional component. The successful final
-build used the installed compiler directly, without the failing cache launcher.
-No SDK source, compiler binary or driver dependency was patched to obtain a pass.
+No framebuffer or FreeRTOS task was added. Existing PSRAM shadow and DMA buffers
+are reused. Native signature verification uses the existing main task with its
+stack raised from 3,584 to 8,192 bytes, plus a fixed four-entry OTA queue (~2.1 KB)
+and small bounded destination/settings state. Existing 30-second render/heap/stack
+serial metrics remain available for a physical benchmark.
 
-## What was not tested
+## Physical checks still required
 
-No physical board was flashed or exercised. Real display output, touch orientation,
-QMI8658 axis alignment, power consumption, BLE range/pairing, restart timing and
-OTA interruption/rollback still need a bench run. UI images use explicitly
-synthetic telemetry; they are not photographs or live-navigation screenshots.
-The onboard PCF85063 and SD card are not used by the existing application.
+No device was flashed or bench-tested. Actual panel/touch orientation, gloves,
+mounting/gyro behavior, power draw/ADC calibration, background Android GPS, BLE
+pairing/reconnection, interrupted OTA and rollback remain unverified on hardware.
+Host signature rejection does not prove hardware power-loss recovery.
+The stock board still cannot report charging/full status. PCF85063 and SD remain
+unused. Preview images use sample telemetry, not live navigation or photographs.
 
-See [setup, source references and runnable checks](WAVESHARE_143.md).
+See [feature behavior, provider constraints and signed installation](RIDER_FEATURES.md)
+and [board setup](WAVESHARE_143.md).

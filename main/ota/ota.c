@@ -9,10 +9,12 @@
 
 // JustRide modules
 #include "display.h"
+#include "device_power.h"
+#include "sdkconfig.h"
 
 static const char *TAG = "OTA";
 
-static ota_status_t s_ota_status = OTA_STATUS_IDLE;
+static volatile ota_status_t s_ota_status = OTA_STATUS_IDLE;
 static esp_ota_handle_t s_ota_handle = 0;
 static const esp_partition_t *s_update_partition = NULL;
 static const esp_partition_t *s_running_partition = NULL;
@@ -45,6 +47,16 @@ esp_err_t ota_start(uint32_t image_size)
     if (s_ota_status == OTA_STATUS_READY || s_ota_status == OTA_STATUS_RECEIVING) {
         return ESP_ERR_INVALID_STATE;
     }
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+#if !CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT && !CONFIG_SECURE_BOOT
+    // A developer build must never silently offer unauthenticated remote OTA.
+    s_ota_status=OTA_STATUS_ERROR_VALIDATION_FAIL;return ESP_ERR_NOT_SUPPORTED;
+#endif
+    if(display_ride_active())return ESP_ERR_INVALID_STATE;
+    if(!power_ota_allowed(device_power_snapshot())) {
+        s_ota_status=OTA_STATUS_ERROR_BATTERY_LOW;return ESP_ERR_INVALID_STATE;
+    }
+#endif
 
     // 1. Identify the inactive target partition
     s_running_partition = esp_ota_get_running_partition();
@@ -128,6 +140,11 @@ esp_err_t ota_finish(void)
         return ESP_ERR_INVALID_SIZE;
     }
     s_ota_status = OTA_STATUS_VERIFYING;
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    if(!power_ota_allowed(device_power_snapshot())) {
+        ota_abort();s_ota_status=OTA_STATUS_ERROR_BATTERY_LOW;return ESP_ERR_INVALID_STATE;
+    }
+#endif
 
     esp_err_t err = esp_ota_end(s_ota_handle);
     s_ota_handle = 0;
@@ -191,7 +208,7 @@ void ota_confirm_boot_valid(void)
     esp_ota_img_states_t ota_state;
     if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
         if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
-            ESP_LOGI(TAG, "Self-tests passed! Confirming firmware valid (cancelling rollback)...");
+            ESP_LOGI(TAG, "Display task heartbeat and BLE startup passed; confirming firmware valid...");
             esp_ota_mark_app_valid_cancel_rollback();
             ESP_LOGI(TAG, "Firmware permanently accepted.");
         }

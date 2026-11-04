@@ -10,6 +10,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
+#include "freertos/queue.h"
+#include "esp_app_desc.h"
 
 // ESP-IDF NimBLE stack headers
 #include "nimble/nimble_port.h"
@@ -103,6 +105,14 @@ static uint16_t s_nav_status_val_handle = 0;
 static bool s_is_connected = false;
 static uint8_t s_ota_last_reported_pct = 0;
 static uint16_t s_ota_expected_seq = 0;
+typedef struct {uint32_t epoch,size;uint16_t sequence,length;uint8_t command,data[510];} ota_request_t;
+static QueueHandle_t s_ota_queue;
+static StaticQueue_t s_ota_queue_storage;
+static uint8_t s_ota_queue_bytes[4*sizeof(ota_request_t)];
+static volatile uint32_t s_ota_epoch;
+static volatile bool s_ota_command_pending;
+bool ble_startup_healthy(void){return ble_hs_synced()!=0 && s_nav_status_val_handle && s_ota_status_val_handle;}
+
 static uint8_t s_own_addr_type;
 static TimerHandle_t s_adv_timer = NULL;
 
@@ -254,121 +264,79 @@ static int ble_time_chr_access(uint16_t conn_handle, uint16_t attr_handle,
 static int ble_ota_control_access(uint16_t conn_handle, uint16_t attr_handle,
                                   struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
-    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-        uint8_t cmd_buf[16] = {0};
-        uint16_t len = 0;
-        ble_hs_mbuf_to_flat(ctxt->om, cmd_buf, sizeof(cmd_buf), &len);
-
-        if (len == 0) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
-
-        uint8_t opcode = cmd_buf[0];
-
-        switch (opcode) {
-        case OTA_CMD_START: {
-            if (s_img_transfer_active) return BLE_ATT_ERR_UNLIKELY;
-            if (len < 5) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
-            uint32_t image_size = (uint32_t)cmd_buf[1] |
-                                  ((uint32_t)cmd_buf[2] << 8) |
-                                  ((uint32_t)cmd_buf[3] << 16) |
-                                  ((uint32_t)cmd_buf[4] << 24);
-
-            ESP_LOGI(TAG, "OTA CMD: START (Size: %" PRIu32 " bytes)", image_size);
-            esp_err_t err = ota_start(image_size);
-            if (err == ESP_OK) {
-                s_ota_last_reported_pct = 0;
-                s_ota_expected_seq = 0;
-                ble_ota_notify_status(OTA_STATUS_READY, 0);
-            } else {
-                display_set_screen(SCREEN_HOME);
-                ble_ota_notify_status(OTA_STATUS_ERROR_FLASH_WRITE, 0);
-            }
-            return 0;
-        }
-
-        case OTA_CMD_FINISH: {
-            ESP_LOGI(TAG, "OTA CMD: FINISH");
-            esp_err_t err = ota_finish();
-            if (err == ESP_OK) {
-                display_show_ota_screen(100);
-                ble_ota_notify_status(OTA_STATUS_SUCCESS, 100);
-            } else {
-                display_set_screen(SCREEN_HOME);
-                ble_ota_notify_status(OTA_STATUS_ERROR_VALIDATION_FAIL, ota_get_progress_percent());
-            }
-            return 0;
-        }
-
-        case OTA_CMD_ABORT: {
-            ESP_LOGW(TAG, "OTA CMD: ABORT");
-            ota_abort();
-            display_set_screen(SCREEN_HOME); // Return back to Home screen safely
-            ble_ota_notify_status(OTA_STATUS_ERROR_ABORTED, 0);
-            return 0;
-        }
-
-        case OTA_CMD_REBOOT: {
-            if (ota_get_status() != OTA_STATUS_SUCCESS) {
-                ESP_LOGW(TAG, "Ignoring OTA reboot: update has not been verified");
-                return BLE_ATT_ERR_UNLIKELY;
-            }
-            ESP_LOGI(TAG, "OTA CMD: REBOOT. Restarting into new firmware...");
-            display_show_ota_screen(100);
-            vTaskDelay(pdMS_TO_TICKS(500));
-            ble_disconnect_and_restart();
-            return 0;
-        }
-
-        default:
-            ESP_LOGW(TAG, "Unknown OTA Control opcode: 0x%02X", opcode);
-            return BLE_ATT_ERR_UNLIKELY;
-        }
-    }
-    return BLE_ATT_ERR_UNLIKELY;
+    if(ctxt->op!=BLE_GATT_ACCESS_OP_WRITE_CHR)return BLE_ATT_ERR_UNLIKELY;
+    uint8_t packet[5];uint16_t len=0;
+    if(ble_hs_mbuf_to_flat(ctxt->om,packet,sizeof(packet),&len)!=0 || !len)
+        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    uint8_t command=packet[0];
+    if(command<OTA_CMD_START || command>OTA_CMD_REBOOT || len!=(command==OTA_CMD_START?5:1))
+        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    if(command==OTA_CMD_START && (s_img_transfer_active || s_ota_command_pending ||
+        ota_get_status()==OTA_STATUS_READY || ota_get_status()==OTA_STATUS_RECEIVING))return BLE_ATT_ERR_UNLIKELY;
+    ota_request_t request={.epoch=s_ota_epoch,.command=command};
+    if(command==OTA_CMD_START)request.size=(uint32_t)packet[1]|((uint32_t)packet[2]<<8)|
+        ((uint32_t)packet[3]<<16)|((uint32_t)packet[4]<<24);
+    if(!s_ota_queue || xQueueSend(s_ota_queue,&request,0)!=pdTRUE)return BLE_ATT_ERR_INSUFFICIENT_RES;
+    if(command==OTA_CMD_START){s_ota_command_pending=true;s_ota_expected_seq=0;}
+    return 0;
 }
 
 static int ble_ota_data_access(uint16_t conn_handle, uint16_t attr_handle,
                                struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
-    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-        uint8_t chunk_buf[512];
-        uint16_t len = 0;
-        int rc = ble_hs_mbuf_to_flat(ctxt->om, chunk_buf, sizeof(chunk_buf), &len);
-        if (rc != 0 || len < 3) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    if(ctxt->op!=BLE_GATT_ACCESS_OP_WRITE_CHR)return BLE_ATT_ERR_UNLIKELY;
+    if(ota_get_status()!=OTA_STATUS_READY && ota_get_status()!=OTA_STATUS_RECEIVING)return BLE_ATT_ERR_UNLIKELY;
+    uint8_t bytes[512];uint16_t len=0;
+    if(ble_hs_mbuf_to_flat(ctxt->om,bytes,sizeof(bytes),&len)!=0 || len<3)return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    uint16_t sequence=(uint16_t)bytes[0]|((uint16_t)bytes[1]<<8);
+    if(s_ota_expected_seq && sequence==(uint16_t)(s_ota_expected_seq-1))return 0;
+    if(sequence!=s_ota_expected_seq)return BLE_ATT_ERR_UNLIKELY;
+    ota_request_t request={.epoch=s_ota_epoch,.command=5,.sequence=sequence,.length=len-2};
+    memcpy(request.data,bytes+2,len-2);
+    if(xQueueSend(s_ota_queue,&request,0)!=pdTRUE)return BLE_ATT_ERR_INSUFFICIENT_RES;
+    s_ota_expected_seq++;
+    return 0;
+}
 
-        // Sequence number in first 2 bytes (Little-Endian)
-        uint16_t seq = (uint16_t)chunk_buf[0] | ((uint16_t)chunk_buf[1] << 8);
-        const uint8_t *payload = &chunk_buf[2];
-        uint16_t payload_len = len - 2;
-
-        // A retry after a lost ATT response must not write the same bytes twice.
-        if (s_ota_expected_seq > 0 && seq == (uint16_t)(s_ota_expected_seq - 1)) {
-            return 0;
-        }
-        if (seq != s_ota_expected_seq) {
-            ESP_LOGW(TAG, "Unexpected OTA chunk sequence: got %u, expected %u",
-                     seq, s_ota_expected_seq);
-            return BLE_ATT_ERR_UNLIKELY;
-        }
-
-        esp_err_t err = ota_write_chunk((uint32_t)seq, payload, payload_len);
-        if (err != ESP_OK) {
-            display_set_screen(SCREEN_HOME);
-            ble_ota_notify_status(OTA_STATUS_ERROR_FLASH_WRITE, ota_get_progress_percent());
-            return BLE_ATT_ERR_UNLIKELY;
-        }
-        s_ota_expected_seq++;
-
-        // Send periodic progress notifications and refresh screen progress (every ~2%)
-        uint8_t current_pct = ota_get_progress_percent();
-        if (current_pct >= s_ota_last_reported_pct + 2 || current_pct == 100) {
-            s_ota_last_reported_pct = current_pct;
-            display_show_ota_screen(current_pct);
-            ble_ota_notify_status(OTA_STATUS_RECEIVING, current_pct);
-        }
-
-        return 0;
+// Reuse app_main's idle loop: flash erase/write/signature checks never run in a GATT callback.
+void ble_process_ota(void) {
+    static uint32_t worker_epoch;
+    if(worker_epoch!=s_ota_epoch) {
+        if(ota_get_status()==OTA_STATUS_READY || ota_get_status()==OTA_STATUS_RECEIVING)ota_abort();
+        worker_epoch=s_ota_epoch;s_ota_command_pending=false;
     }
-    return BLE_ATT_ERR_UNLIKELY;
+    ota_request_t request;
+    if(!s_ota_queue || xQueueReceive(s_ota_queue,&request,0)!=pdTRUE)return;
+    if(request.epoch!=s_ota_epoch || !s_is_connected)return;
+    esp_err_t error=ESP_OK;
+    switch(request.command) {
+    case OTA_CMD_START:
+        error=ota_start(request.size);s_ota_command_pending=false;s_ota_last_reported_pct=0;break;
+    case 5:
+        error=ota_write_chunk(request.sequence,request.data,request.length);break;
+    case OTA_CMD_FINISH:
+        error=ota_finish();break;
+    case OTA_CMD_ABORT:
+        ota_abort();display_set_screen(SCREEN_HOME);break;
+    case OTA_CMD_REBOOT:
+        if(ota_get_status()==OTA_STATUS_SUCCESS)ble_disconnect_and_restart();
+        return;
+    }
+    if(request.epoch!=s_ota_epoch) {
+        if(ota_get_status()==OTA_STATUS_READY || ota_get_status()==OTA_STATUS_RECEIVING)ota_abort();
+        return;
+    }
+    if(error!=ESP_OK) {
+        uint8_t status=ota_get_status();
+        if(status<5) {ota_abort();status=OTA_STATUS_ERROR_ABORTED;}
+        display_set_screen(SCREEN_HOME);ble_ota_notify_status(status,ota_get_progress_percent());return;
+    }
+    uint8_t progress=ota_get_progress_percent();
+    if(request.command!=5 || progress>=s_ota_last_reported_pct+2 || progress==100) {
+        s_ota_last_reported_pct=progress;
+        if(request.command!=OTA_CMD_ABORT)display_show_ota_screen(progress);
+        ble_ota_notify_status(ota_get_status(),progress);
+    }
 }
 
 static int ble_ota_status_access(uint16_t conn_handle, uint16_t attr_handle,
@@ -413,6 +381,9 @@ static int ble_img_control_access(uint16_t conn_handle, uint16_t attr_handle,
 
     switch (cmd_buf[0]) {
     case IMG_CMD_START: {
+        if(s_ota_command_pending || ota_get_status()==OTA_STATUS_READY ||
+           ota_get_status()==OTA_STATUS_RECEIVING || ota_get_status()==OTA_STATUS_VERIFYING)
+            return BLE_ATT_ERR_UNLIKELY;
         uint32_t image_size = (len >= 5)
             ? ((uint32_t)cmd_buf[1] | ((uint32_t)cmd_buf[2] << 8)
               | ((uint32_t)cmd_buf[3] << 16) | ((uint32_t)cmd_buf[4] << 24))
@@ -571,7 +542,7 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
             ((uint32_t)rx_buf[3] << 16) | ((uint32_t)rx_buf[4] << 24);
         uint8_t op = rx_buf[5];
         if (!((op >= NAV_OP_START && op <= NAV_OP_STOP) || op == NAV_OP_SYNC ||
-              op == NAV_OP_ROUTE_SEGMENT || op == NAV_OP_CONTEXT || (op >= 0x14 && op <= 0x19)))
+              op == NAV_OP_ROUTE_SEGMENT || op == NAV_OP_CONTEXT || op == 0x1f || (op >= 0x14 && op <= 0x19)))
             return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
         if (s_revision_received && (int32_t)(revision - s_route_revision) < 0) return BLE_ATT_ERR_UNLIKELY;
         if (!s_revision_received || revision != s_route_revision) {
@@ -593,6 +564,17 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
     if(rx_buf[0]==0x1d) {
         if(len!=2 || rx_buf[1]!=0)return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
         device_power_publish();return 0;
+    }
+    if(rx_buf[0]==0x1e) {
+        if((len!=2 && len!=4) || rx_buf[1]>1 || (len==4 && (rx_buf[2]>1 || rx_buf[3]>100)))
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        if(len==2)display_set_glove_mode(rx_buf[1]!=0);
+        else display_configure_rider_options(rx_buf[1]!=0,rx_buf[2]!=0,rx_buf[3]);
+        return 0;
+    }
+    if(rx_buf[0]==0x1f) {
+        if(len<2 || rx_buf[1]>31 || len!=2+rx_buf[1])return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        char name[32]={0};memcpy(name,rx_buf+2,rx_buf[1]);display_set_destination(name);return 0;
     }
     if (rx_buf[0] == 0x1A) {
         if (len != 2 || rx_buf[1] > 1) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
@@ -979,7 +961,11 @@ static int ble_nav_status_access(uint16_t conn_handle, uint16_t attr_handle,
 {
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
 #if CONFIG_JUSTRIDE_ROUND_AMOLED
-        uint8_t status_buf[4] = {1,3,7,9}; // Power telemetry; ESP image chip ID 9 = S3.
+        uint8_t status_buf[37] = {1,4,7,9}; // Options, chip, security flags, running version.
+#if CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT || CONFIG_SECURE_BOOT
+        status_buf[4]=1;
+#endif
+        snprintf((char*)status_buf+5,32,"%s",esp_app_get_description()->version);
 #else
         uint8_t status_buf[3] = {1,3,3}; // Original ESP32 protocol remains unchanged.
 #endif
@@ -1240,11 +1226,9 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
         s_revision_received = false;
         s_is_connected = false;
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-        if (ota_get_status() == OTA_STATUS_READY ||
-            ota_get_status() == OTA_STATUS_RECEIVING) {
-            ota_abort();
-            display_set_screen(SCREEN_HOME);
-        }
+        ++s_ota_epoch; // Worker aborts flash work and discards this connection's queued packets.
+        s_ota_command_pending=false;
+        if(ota_get_status()==OTA_STATUS_READY || ota_get_status()==OTA_STATUS_RECEIVING)display_set_screen(SCREEN_HOME);
         ESP_LOGW(TAG, "Phone disconnected! Reason=0x%04X (%d). Resuming advertising in 120ms...",
                  event->disconnect.reason, event->disconnect.reason);
         display_set_ble_status(false);
@@ -1311,6 +1295,8 @@ static void ble_host_task(void *param)
 void ble_init(void)
 {
     ESP_LOGI(TAG, "JustRide BLE starting...");
+    s_ota_queue=xQueueCreateStatic(4,sizeof(ota_request_t),s_ota_queue_bytes,&s_ota_queue_storage);
+    configASSERT(s_ota_queue);
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {

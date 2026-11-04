@@ -142,6 +142,12 @@ void display_prev_screen(void);
 /** Set display brightness level (0 to 100%) */
 void display_set_brightness(uint8_t brightness_pct);
 uint8_t display_get_brightness(void);
+void display_set_glove_mode(bool enabled);
+void display_configure_rider_options(bool glove,bool automatic,uint8_t manual);
+void display_save_preferences(void);
+bool display_startup_healthy(void);
+bool display_ride_active(void);
+void display_set_destination(const char *name);
 
 /** Update live vehicle speed (km/h) */
 void display_set_speed(uint16_t speed_kmh);

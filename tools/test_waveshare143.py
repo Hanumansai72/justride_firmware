@@ -174,6 +174,10 @@ __declspec(dllexport) int run_board_checks(void){
    assert(!p.valid && !memcmp(packet,(uint8_t[]){0x1d,1,0,0,255,255,0,0,0,0},10));
  }
  assert(power_percent(3200)==0 && power_percent(4200)==100);
+ assert(power_ota_allowed(power_measurement(1667,1000,0)));
+ assert(power_ota_allowed(power_measurement(1250,1000,0)));
+ assert(!power_ota_allowed(power_measurement(1100,1000,0)));
+ assert(!power_ota_allowed(power_measurement(0,1000,0)));
  for(int mv=3001;mv<=4300;mv++)assert(power_percent(mv)>=power_percent(mv-1));
  assert(power_measurement(1250,1020,0).rail_mv==3825);
  power_warning_t warning={0};
@@ -201,14 +205,26 @@ __declspec(dllexport) int run_board_checks(void){
  assert(ride_recovery(true,true,true,false,false,0)==RIDE_LIVE); // A fresh packet recovers without a tap.
  for(int direction=0;direction<=13;direction++) {
    bool turn=direction>=2 && direction<=7;
-   assert(ride_turn_alert(direction,3,100,RIDE_LIVE)==turn);
-   assert(!ride_turn_alert(direction,3,101,RIDE_LIVE));
+   assert(ride_turn_alert(direction,3,15,RIDE_LIVE)==turn);
+   assert(ride_turn_alert(direction,3,0,RIDE_LIVE)==turn);
+   assert(!ride_turn_alert(direction,3,16,RIDE_LIVE));
    assert(!ride_turn_alert(direction,5,10,RIDE_LIVE));
    for(int state=RIDE_RECONNECTING;state<=RIDE_STALE;state++)
      assert(!ride_turn_alert(direction,4,10,state));
  }
  assert(ride_turn_side(4)==-1 && ride_turn_side(5)==1);
  assert(ride_blink_on(0) && ride_blink_on(499999) && !ride_blink_on(500000) && ride_blink_on(1000000));
+ assert(ride_sharp_warning(6,3,50,0,RIDE_LIVE));
+ assert(!ride_sharp_warning(6,3,51,0,RIDE_LIVE));
+ assert(ride_sharp_warning(7,3,100,60,RIDE_LIVE));
+ assert(!ride_sharp_warning(7,5,10,60,RIDE_LIVE));
+ assert(!ride_sharp_warning(7,3,10,60,RIDE_STALE));
+ assert(!ride_sharp_warning(4,3,10,60,RIDE_LIVE));
+ assert(ride_scheduled_brightness(6)==35 && ride_scheduled_brightness(7)==85);
+ assert(ride_scheduled_brightness(18)==85 && ride_scheduled_brightness(19)==35);
+ assert(ride_call_action(true,67,190)==2 && ride_call_action(false,67,190)==0);
+ assert(ride_call_action(true,253,280)==1 && ride_call_action(false,253,280)==0);
+ assert(ride_call_action(true,160,235)==0 && ride_call_action(true,111,189)==0);
  // Gravity projection supports flat and upright mounting and rejects pitch-only rotation.
  int16_t gyro[3]={0,0,640};
  assert(motion_turn_raw(gyro,0,0,16384)==640);

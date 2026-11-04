@@ -109,7 +109,8 @@ __declspec(dllexport) int render_round(void) {
     // SAMPLE TELEMETRY ONLY: same production renderer, no device/GPS claims.
     round_route_point_t points[]={{160,160},{160,135},{160,110},{194,90},{208,66},{178,42},{166,8}};
     round_nav_t v={.nav={.speed=45,.speed_valid=true,.direction=5,.distance_m=300,.heading=0},
-        .points=points,.count=7,.zoom_percent=100,.trip_valid=true,.arrival_time="14:42"};
+        .points=points,.count=7,.zoom_percent=100,.trip_valid=true,.arrival_time="14:42",
+        .destination="STOP 1 - CITY CENTER",.next_direction=5};
     v.nav.remaining_km=12.8f;
     v.nav.direction=8;v.nav.distance_m=70;v.nav.speed=28;
     round_ui_navigation(&v);capture_save("u-turn.rgb565");
@@ -122,7 +123,7 @@ __declspec(dllexport) int render_round(void) {
     v.nav.direction=4;round_ui_navigation(&v);capture_save("navigation-left.rgb565");
     assert(memcmp(previous,capture_pixels(),sizeof previous));
     v.nav.distance_m=120;round_ui_navigation(&v);capture_save("distance-update.rgb565");
-    v.nav.distance_m=80;v.maneuver_state=3;v.blink_on=true;
+    v.nav.distance_m=15;v.maneuver_state=3;v.blink_on=true;
     round_ui_navigation(&v);capture_save("turn-left-on.rgb565");
     memcpy(previous,capture_pixels(),sizeof previous);
     v.blink_on=false;round_ui_navigation(&v);capture_save("turn-left-off.rgb565");
@@ -139,6 +140,9 @@ __declspec(dllexport) int render_round(void) {
     v.nav.direction=5;v.blink_on=true;
     round_ui_navigation(&v);capture_save("turn-right-on.rgb565");
     v.blink_on=false;round_ui_navigation(&v);capture_save("turn-right-off.rgb565");
+    v.nav.direction=6;v.nav.distance_m=70;v.blink_on=false;
+    round_ui_navigation(&v);capture_save("sharp-turn.rgb565");
+    v.nav.direction=5;v.nav.distance_m=15;
     v.recovery=RIDE_STALE;round_ui_navigation(&v);capture_save("stale-data.rgb565");
     v.recovery=RIDE_RECONNECTING;round_ui_navigation(&v);capture_save("reconnecting.rgb565");
     v.recovery=RIDE_GPS_WEAK;round_ui_navigation(&v);capture_save("gps-weak.rgb565");
@@ -164,6 +168,10 @@ __declspec(dllexport) int render_round(void) {
     round_ui_music("Highway Star","Deep Purple","",true,31,true);capture_save("music.rgb565");
     round_ui_music("No player","","CONNECT A PLAYER ON PHONE",false,0,false);capture_save("music-offline.rgb565");
     round_ui_call("Rohit",3,true);capture_save("call.rgb565");
+    round_ui_set_glove_mode(true);
+    round_ui_call("Rohit",3,true);capture_save("call-large.rgb565");
+    round_ui_music("Highway Star","Deep Purple","",true,31,true);capture_save("music-large.rgb565");
+    round_ui_set_glove_mode(false);
     round_ui_call("A caller with a very long name",0,false);capture_save("call-offline.rgb565");
     v.nav.distance_m=300;v.nav.direction=5;strcpy(v.nav.instruction,"");
     round_ui_navigation(&v);round_ui_notification("WhatsApp","Rahul","On my way!");capture_save("notification.rgb565");

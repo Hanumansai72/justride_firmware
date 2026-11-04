@@ -12,6 +12,9 @@ typedef struct {
 static inline bool power_is_low(device_power_t p) {
     return p.valid && p.source==1 && p.percent<=15;
 }
+static inline bool power_ota_allowed(device_power_t p) {
+    return p.valid && (p.source==2 || (p.source==1 && p.percent>=30 && p.percent<=100));
+}
 typedef struct {unsigned samples;bool warned;} power_warning_t;
 static inline bool power_warning_update(power_warning_t *w,device_power_t p) {
     if(p.valid && (p.source==2 || (p.source==1 && p.percent>=20)))w->warned=false;

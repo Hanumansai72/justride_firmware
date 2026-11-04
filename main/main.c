@@ -261,11 +261,18 @@ void app_main(void)
     ESP_LOGI(TAG, "All subsystems running. 2.8\" HUD operational.");
 #endif
 
-    // Keep rollback available if the new image fails during initial startup.
-    vTaskDelay(pdMS_TO_TICKS(10000));
-    ota_confirm_boot_valid();
+    // Require live core tasks, not just elapsed time, before accepting an update.
+    bool healthy=false;
+    for(unsigned i=0;i<30;i++) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if(i>=9 && display_startup_healthy() && ble_startup_healthy()){healthy=true;break;}
+    }
+    if(healthy)ota_confirm_boot_valid();
+    else ESP_ERROR_CHECK(esp_ota_mark_app_invalid_rollback_and_reboot());
 
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(10));
+        ble_process_ota();
+        display_save_preferences();
     }
 }
