@@ -4,7 +4,11 @@
 #else
 #include "display_tft.h"
 #endif
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+#include "assets/round_fonts.h"
+#else
 #include "assets/hud_fonts.h"
+#endif
 #include <ctype.h>
 #include <math.h>
 #include <stdio.h>
@@ -22,6 +26,18 @@ static const hud_font_t *font(unsigned size) {
     return &hud_font_16;
   case 22:
     return &hud_font_22;
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+  case 18:
+    return &hud_font_18;
+  case 20:
+    return &hud_font_20;
+  case 38:
+    return &hud_font_38;
+  case 24:
+    return &hud_font_24;
+  case 32:
+    return &hud_font_32;
+#endif
   case 36:
     return &hud_font_36;
   case 52:

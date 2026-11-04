@@ -203,17 +203,6 @@ __declspec(dllexport) int run_board_checks(void){
  assert(ride_recovery(true,true,true,false,false,4999999)==RIDE_LIVE);
  assert(ride_recovery(true,true,true,false,false,5000000)==RIDE_STALE);
  assert(ride_recovery(true,true,true,false,false,0)==RIDE_LIVE); // A fresh packet recovers without a tap.
- for(int direction=0;direction<=13;direction++) {
-   bool turn=direction>=2 && direction<=7;
-   assert(ride_turn_alert(direction,3,15,RIDE_LIVE)==turn);
-   assert(ride_turn_alert(direction,3,0,RIDE_LIVE)==turn);
-   assert(!ride_turn_alert(direction,3,16,RIDE_LIVE));
-   assert(!ride_turn_alert(direction,5,10,RIDE_LIVE));
-   for(int state=RIDE_RECONNECTING;state<=RIDE_STALE;state++)
-     assert(!ride_turn_alert(direction,4,10,state));
- }
- assert(ride_turn_side(4)==-1 && ride_turn_side(5)==1);
- assert(ride_blink_on(0) && ride_blink_on(499999) && !ride_blink_on(500000) && ride_blink_on(1000000));
  assert(ride_sharp_warning(6,3,50,0,RIDE_LIVE));
  assert(!ride_sharp_warning(6,3,51,0,RIDE_LIVE));
  assert(ride_sharp_warning(7,3,100,60,RIDE_LIVE));

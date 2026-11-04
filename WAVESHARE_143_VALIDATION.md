@@ -2,14 +2,14 @@
 
 | Check | Result |
 |---|---|
-| ESP-IDF 5.5.5 / Waveshare signed-update profile | Pass; unsigned/padded application 851,968 bytes; signed image 856,064 bytes of the unchanged 1,769,472-byte OTA slot (about 52% free) |
+| ESP-IDF 5.5.5 / Waveshare signed-update profile | Pass; unsigned/padded application 983,040 bytes; signed image 987,136 bytes of the unchanged 1,769,472-byte OTA slot (about 44% free) |
 | Original ESP32 2.8-inch profile | Pass; retained 4 MB target compiles independently |
 | Signature tooling | Native ESP-IDF verification accepts the signed image, rejects wrong-key, modified and truncated images |
-| Firmware host checks | Pass: actual QSPI/FT3168 mocked I/O, power/motion, 15 m vs 16 m blink boundary, warning completion/stale suppression, day/night boundaries and larger call hit regions |
+| Firmware host checks | Pass: actual QSPI/FT3168 mocked I/O, power/motion, steady guidance and turn-direction checks, warning completion/stale suppression, day/night boundaries and larger call hit regions |
 | Touch/wake driver suite | Pass: 101 checks × four rotations, 404 total |
 | Map receiver/camera bounds | Pass |
-| Round renderer | Production C captures; blink changes only left overlay bounds; blink-off preserves map and white pointer |
-| Focused companion-app regression set | 49 tests passed, including multi-stop edits/skip, failed next-leg retention, confirmed intermediate arrival, late responses, history/trail persistence, power guards and existing navigation/BLE/clock/zoom checks |
+| Round renderer | Production C captures; identical repeated guidance frames; turn direction still updates; no chevrons or timed blink |
+| Focused companion-app regression set | 51 tests passed, including multi-stop edits/skip, failed next-leg retention, confirmed intermediate arrival, late responses, trail persistence, power guards and navigation/BLE/clock/zoom checks |
 | Changed app code analysis | No errors or warnings; informational style lints remain |
 
 The included private companion-app source remains in its separate checkout and is
@@ -17,16 +17,19 @@ not published in this public firmware repository. Release packaging verifies tha
 its S3 asset matches the signed USB application, while its separate original ESP32
 asset stays intact. The APK retains the project's prototype/debug signing key.
 
-The broader pre-existing app suite is not clean: speed_filter_test.dart references
+The broader app suite is not clean: speed_filter_test.dart references
 missing SpeedFilter.toKmh, and ui_cleanup_test.dart depends on unsupported desktop
 Bluetooth plus outdated settling/image expectations. Those unrelated tests were
-left intact. No CodeRabbit review is claimed.
+left intact. The expanded run also has three history/layout failures: missing
+desktop path-provider setup in the upload test, registration assertion failure,
+and dashboard API/layout expectations. These are not covered by the passing
+focused set and remain unresolved. No CodeRabbit review is claimed.
 
 ## Memory and performance
 
-The unsigned application grew from 822,256 bytes to 851,968 bytes; signing adds
-one 4,096-byte sector. Final signed growth is 33,808 bytes (about 4.1%).
-ELF reported static D/IRAM is 149,191 bytes, with .data 42,054 and .bss 10,000;
+The padded unsigned application is 983,040 bytes; signing adds one 4,096-byte
+sector. Reference-style fonts add flash data, without another framebuffer.
+ELF reports .data 40,790 bytes and .bss 10,160 bytes;
 these section values are not runtime free heap. Actual runtime memory/latency
 before/after was not measured because no board is attached.
 

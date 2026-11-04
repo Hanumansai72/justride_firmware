@@ -8,7 +8,7 @@ profile still compiles; the separate version-2.0 working checkout is untouched.
 
 | Feature | Implementation and limits |
 |---|---|
-| Turn blink | Medium green chevrons on the left at **15 metres or closer**, 500 ms on/off. Map and white pointer remain visible. Suppressed after completion or during stale/GPS/recovery/paused/overview states. Optional phone vibration retains its separate earlier 100 m warning. |
+| Turn guidance | Steady white direction arrow; chevron overlay, compass and blink-triggered redraws removed. Green route and white pointer remain visible. The red/white circle shows live GPS speed, explicitly labelled km/h; it is not a provider speed limit. Optional phone vibration retains its separate earlier 100 m warning. |
 | Multi-stop | Phone navigation → **Stops**: search/add, remove or move future stops; active stop stays first. **Skip active stop** changes it explicitly. Accurate, slow, confirmed arrival advances once. Only the active leg is requested; future-stop edits are local. Failed next-leg requests retain the new destination and suppress the old guidance until retry succeeds. Device shows the active stop and following maneuver. Up to 20 remaining stops. |
 | Larger controls | Device settings toggle enlarges round call/music controls and their touch regions, preserving gaps and normal mode. This does not change FT3168 capacitance sensitivity. Ordinary-glove detection is unverified. |
 | Hazard alerts | Compact sharp-left/right warning only from provider-supplied sharp maneuver codes. Continuous indication for the current maneuver avoids repeated popups; it clears after passage/completion, reroute or stale guidance. Threshold is six seconds of travel, clamped to 50–200 m. No invented closures, dangerous junctions or hazard database. |
@@ -62,11 +62,11 @@ stock board; VCC is not battery voltage while USB-powered.
 
 ## Validation and memory
 
-49 focused Flutter tests passed, including six actual NavigationService tests,
+51 focused Flutter tests passed, including six actual NavigationService tests,
 arrival progression, skip/failure handling, local trail round-trip, power guards,
 navigation accuracy, BLE packets, touch zoom, clock and existing gap diagnostics.
 The broader pre-existing app test failures remain documented separately.
-Native host checks cover panel/touch/power, 15/16 m blink boundary, warning bounds,
+Native host checks cover panel/touch/power, steady-frame/direction checks, warning bounds,
 day/night boundaries, enlarged call hit regions, wake behavior and rendering.
 Native signature tooling accepts the signed release and rejects wrong-key,
 modified and truncated images. These do not replace a physical interrupted-OTA test.
@@ -94,3 +94,33 @@ service/screens, BLE navigation service, OTA service and device settings. No sec
 GPS/BLE/database service was introduced. `path_provider` was already installed
 transitively and is now declared directly; unused `google_fonts` and
 `smooth_page_indicator` were removed after checking for references.
+
+## Typography revision
+
+The round renderer uses bundled Roboto regular, medium and bold TTFs under the
+Apache-2.0 license in tools/fonts. tools/generate_round_fonts.py regenerates
+bounded 4-bit glyph masks. The original 2.8-inch glyphs are unchanged. Main
+distance is 38 logical pixels, its unit 28, and instruction 20, with smaller
+fallbacks for long text; the 320 logical canvas maps to the 466×466 panel. These
+fonts approximate the reference; its original family cannot be proven from the
+raster alone. Answer/end-call buttons use standard Material phone glyphs.
+
+Home shows synchronized current time (24-hour HH:MM), day/date/year, travelled
+distance and battery percentage. Travel duration is hidden here but still
+recorded in journey summaries. The displayed percentage has no tilde; it remains
+a voltage-based estimate and is unavailable during USB power. Unknown values
+show dashes. Clock synchronization and the 15-second standby behavior are retained.
+Tap the navigation rider to recenter, or the ETA footer for route overview.
+Destination and next-maneuver labels appear in overview only.
+
+Protocol v5 adds real music elapsed/duration, optional caller number and a six-byte
+home distance packet: [0x21, valid, distanceLE32]. The app sends these extensions
+only to a capable board; old-board packet layouts remain unchanged. Music artist
+text is smaller, and unknown playback duration is shown as dashes.
+
+Navigation still follows the phone's actual geometry: straight sections render
+straight and curves remain curved. Near a maneuver the existing lookahead can
+reveal a short outgoing section; the S-curve in previews is sample input only.
+Street backgrounds require a permitted map-data provider, configured backend/key
+and round-display viewport/compositor integration. A key alone does not enable
+them. This release keeps the user-selected black route-only background.

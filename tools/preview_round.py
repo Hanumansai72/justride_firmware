@@ -16,6 +16,7 @@ from PIL import Image, ImageDraw, ImageFont
 ROOT=Path(__file__).resolve().parents[1]
 parser=argparse.ArgumentParser()
 parser.add_argument('--reference',type=Path,help='Optional untouched reference for a side-by-side comparison')
+parser.add_argument('--reference-dir',type=Path,help='Customer asset directory for the three-screen reference comparison')
 args=parser.parse_args()
 OUT=ROOT/'build/round-preview'
 OUT.mkdir(parents=True,exist_ok=True)
@@ -65,6 +66,39 @@ void capture_save(const char *path){FILE *f=fopen(path,"wb");assert(f);fwrite(fr
 const uint8_t *capture_pixels(void){return framebuffer;}
 '''
 (OUT/'raster.c').write_text(shim+'\n'+font+'\n'+primitives)
+
+# Capture the actual settings/brightness functions with only external state mocked.
+display_source=(ROOT/'main/display/display.c').read_text(encoding='utf-8')
+def c_function(signature):
+    start=display_source.index(signature)
+    opening=display_source.index('{',start)
+    depth=1;end=opening+1
+    while depth:
+        depth += (display_source[end]=='{')-(display_source[end]=='}')
+        end+=1
+    return display_source[start:end]
+auxiliary = r'''
+#include <stdio.h>
+#define DISPLAY_WIDTH 320
+#define COLOR_BLACK 0
+#define COLOR_WHITE 0xffff
+#define COLOR_DARKGREY JR_BORDER
+#define COLOR_LIGHTGREY JR_MUTED
+#define COLOR_JUST_GREEN JR_PRIMARY
+#define SETTINGS_ACCENT JR_PRIMARY
+typedef int screen_id_t;
+enum {SCREEN_SETTINGS=3,SCREEN_BRIGHTNESS=4};
+static bool s_is_initialized=true,s_ble_connected=true;
+static bool s_show_reset_confirm,s_show_brightness_popup,s_show_motion_settings;
+static int s_current_screen;
+static uint8_t s_brightness_pct=80;
+void tft_set_round_canvas(bool round){(void)round;}
+static void display_init(void){}
+static bool mpu6500_is_calibration_complete(void){return true;}
+static void render_motion_settings(bool force){(void)force;}
+static void render_notification_banner(void){}
+''' + c_function('static void render_pagination(') + '\n' + c_function('void display_show_settings_screen(void) {') + '\n' + c_function('void display_show_brightness_screen(void) {')
+
 fixture=r'''
 #include "round_ui.h"
 #include "round_geometry.h"
@@ -107,9 +141,9 @@ __declspec(dllexport) int render_round(void) {
     }
     for(unsigned i=240*320*2;i<sizeof previous;i++)assert(capture_pixels()[i]==0);
     // SAMPLE TELEMETRY ONLY: same production renderer, no device/GPS claims.
-    round_route_point_t points[]={{160,160},{160,135},{160,110},{194,90},{208,66},{178,42},{166,8}};
+    round_route_point_t points[]={{160,160},{172,149},{182,138},{187,127},{187,117},{181,106},{170,95},{160,84},{149,73},{138,62},{132,51},{132,41},{138,30},{148,19},{160,8}};
     round_nav_t v={.nav={.speed=45,.speed_valid=true,.direction=5,.distance_m=300,.heading=0},
-        .points=points,.count=7,.zoom_percent=100,.trip_valid=true,.arrival_time="14:42",
+        .points=points,.count=15,.zoom_percent=100,.trip_valid=true,.arrival_time="14:42",
         .destination="STOP 1 - CITY CENTER",.next_direction=5};
     v.nav.remaining_km=12.8f;
     v.nav.direction=8;v.nav.distance_m=70;v.nav.speed=28;
@@ -117,30 +151,24 @@ __declspec(dllexport) int render_round(void) {
     v.nav.direction=11;v.nav.distance_m=150;v.nav.speed=45;
     strcpy(v.nav.instruction,"Take flyover");
     round_ui_navigation(&v);capture_save("flyover-current.rgb565");
-    v.nav.direction=5;v.nav.distance_m=300;strcpy(v.nav.instruction,"");
-    round_ui_navigation(&v);capture_save("navigation.rgb565");
+    v.nav.direction=5;v.nav.distance_m=300;v.nav.speed=70;strcpy(v.nav.instruction,"");
+    round_ui_navigation(&v);capture_save("navigation-reference.rgb565");
+    v.nav.speed=45;round_ui_navigation(&v);capture_save("navigation.rgb565");
     memcpy(previous,capture_pixels(),sizeof previous);
     v.nav.direction=4;round_ui_navigation(&v);capture_save("navigation-left.rgb565");
     assert(memcmp(previous,capture_pixels(),sizeof previous));
     v.nav.distance_m=120;round_ui_navigation(&v);capture_save("distance-update.rgb565");
-    v.nav.distance_m=15;v.maneuver_state=3;v.blink_on=true;
-    round_ui_navigation(&v);capture_save("turn-left-on.rgb565");
+    v.nav.distance_m=15;v.maneuver_state=3;
+    round_ui_navigation(&v);capture_save("turn-left.rgb565");
     memcpy(previous,capture_pixels(),sizeof previous);
-    v.blink_on=false;round_ui_navigation(&v);capture_save("turn-left-off.rgb565");
-    assert(memcmp(previous,capture_pixels(),sizeof previous));
-    for(int yy=0;yy<320;yy++)for(int xx=0;xx<320;xx++) {
-        unsigned at=(yy*320+xx)*2;
-        if(xx<32 || xx>=109 || yy<127 || yy>=177)
-            assert(previous[at]==capture_pixels()[at] && previous[at+1]==capture_pixels()[at+1]);
-    }
-    memcpy(previous,capture_pixels(),sizeof previous);
+    round_ui_navigation(&v);
+    assert(!memcmp(previous,capture_pixels(),sizeof previous)); // Steady guidance, no timed overlay.
     v.maneuver_state=5;round_ui_navigation(&v);
-    assert(!memcmp(previous,capture_pixels(),sizeof previous)); // Blink off preserves the full map and pointer.
-    v.maneuver_state=3;
-    v.nav.direction=5;v.blink_on=true;
-    round_ui_navigation(&v);capture_save("turn-right-on.rgb565");
-    v.blink_on=false;round_ui_navigation(&v);capture_save("turn-right-off.rgb565");
-    v.nav.direction=6;v.nav.distance_m=70;v.blink_on=false;
+    assert(!memcmp(previous,capture_pixels(),sizeof previous));
+    v.maneuver_state=3;v.nav.direction=5;
+    round_ui_navigation(&v);capture_save("turn-right.rgb565");
+    assert(memcmp(previous,capture_pixels(),sizeof previous)); // Direction still updates.
+    v.nav.direction=6;v.nav.distance_m=70;
     round_ui_navigation(&v);capture_save("sharp-turn.rgb565");
     v.nav.direction=5;v.nav.distance_m=15;
     v.recovery=RIDE_STALE;round_ui_navigation(&v);capture_save("stale-data.rgb565");
@@ -162,22 +190,27 @@ __declspec(dllexport) int render_round(void) {
     round_ui_navigation(&v);capture_save("overview.rgb565");
     v.overview=false;v.count=0;strcpy(v.nav.instruction,"SYNCING");
     round_ui_navigation(&v);capture_save("waiting-for-route.rgb565");
-    v.count=7;v.nav.distance_m=4294967295u;v.nav.heading=359;v.nav.speed=300;
+    v.count=15;v.nav.distance_m=4294967295u;v.nav.heading=359;v.nav.speed=300;
     round_ui_navigation(&v);capture_save("bounds.rgb565");
-    round_ui_clock(10,24,"MON, 02 NOV 2026",12.8f);capture_save("clock.rgb565");
-    round_ui_music("Highway Star","Deep Purple","",true,31,true);capture_save("music.rgb565");
-    round_ui_music("No player","","CONNECT A PLAYER ON PHONE",false,0,false);capture_save("music-offline.rgb565");
-    round_ui_call("Rohit",3,true);capture_save("call.rgb565");
+    round_ui_home("14:42","WED, 04 NOV 2026",12800,50,true);capture_save("clock.rgb565");
+    round_ui_music("Highway Star","Deep Purple","",true,31,true,105,200);capture_save("music.rgb565");
+    round_ui_music("No player","","CONNECT A PLAYER ON PHONE",false,0,false,0,0);capture_save("music-offline.rgb565");
+    round_ui_call("Rohit","+91 98765 43210",3,true);capture_save("call.rgb565");
     round_ui_set_glove_mode(true);
-    round_ui_call("Rohit",3,true);capture_save("call-large.rgb565");
-    round_ui_music("Highway Star","Deep Purple","",true,31,true);capture_save("music-large.rgb565");
+    round_ui_call("Rohit","+91 98765 43210",3,true);capture_save("call-large.rgb565");
+    round_ui_music("Highway Star","Deep Purple","",true,31,true,105,200);capture_save("music-large.rgb565");
     round_ui_set_glove_mode(false);
-    round_ui_call("A caller with a very long name",0,false);capture_save("call-offline.rgb565");
+    round_ui_call("A caller with a very long name","",0,false);capture_save("call-offline.rgb565");
     v.nav.distance_m=300;v.nav.direction=5;strcpy(v.nav.instruction,"");
     round_ui_navigation(&v);round_ui_notification("WhatsApp","Rahul","On my way!");capture_save("notification.rgb565");
+    display_show_settings_screen();capture_save("settings.rgb565");
+    s_show_reset_confirm=true;display_show_settings_screen();capture_save("settings-reset.rgb565");
+    s_show_reset_confirm=false;
+    display_show_brightness_screen();capture_save("brightness.rgb565");
     return 0;
 }
 '''
+fixture=fixture.replace('__declspec(dllexport) int render_round(void) {', auxiliary+'\n__declspec(dllexport) int render_round(void) {')
 (OUT/'fixture.c').write_text(fixture)
 (OUT/'ucrt.def').write_text('LIBRARY ucrtbase.dll\nEXPORTS\ncosf\nsinf\nfminf\nlroundf\nsqrtf\natan2f\nroundf\nabs\nabort\nmemset\nmemcpy\nmemcmp\nstrlen\nstrcpy\nstrstr\nstrcmp\ntoupper\nfopen\nfwrite\nfclose\n')
 (OUT/'msvcrt.def').write_text('LIBRARY msvcrt.dll\nEXPORTS\n_snprintf\n')
@@ -199,7 +232,14 @@ for file in OUT.glob('*.rgb565'):
     # Exact integer pixel replication from round_panel_pixels(), not Pillow's
     # center-sampled nearest resize (which differs at some row boundaries).
     indices=[((p+1)*320-1)//466 for p in range(466)]
-    canvas=Image.new('RGB',(466,466));canvas.putdata([rgb[y*320+x] for y in indices for x in indices])
+    canvas=Image.new('RGB',(466,466))
+    if file.stem in ('settings','settings-reset','brightness'):
+        xs=[((p+1)*320-1)//352 for p in range(352)]
+        ys=[((p+1)*240-1)//264 for p in range(264)]
+        pane=Image.new('RGB',(352,264));pane.putdata([rgb[y*320+x] for y in ys for x in xs])
+        canvas.paste(pane,(57,101))
+    else:
+        canvas.putdata([rgb[y*320+x] for y in indices for x in indices])
     mask=Image.new('L',(466,466));ImageDraw.Draw(mask).ellipse((0,0,465,465),fill=255)
     result=Image.new('RGB',(506,506),'#111719');result.paste(canvas,(20,20),mask)
     result.save(file.with_suffix('.png'))
@@ -214,7 +254,7 @@ draw.text((20,1080),'Production C renderer with SAMPLE data. Physical panel/touc
 sheet.save(OUT/'screens.png')
 ux=Image.new('RGB',(1530,1650),'#111719');d=ImageDraw.Draw(ux)
 for i,(name,label) in enumerate([
-    ('turn-left-on','LEFT TURN / BLINK ON'),('turn-right-on','RIGHT TURN / BLINK ON'),('turn-left-off','LEFT TURN / BLINK OFF'),
+    ('turn-left','STEADY LEFT TURN'),('turn-right','STEADY RIGHT TURN'),('navigation-left','ROUTE / NO CHEVRONS'),
     ('navigation','LIVE ETA + REMAINING'),('reconnecting','RECONNECTING / STALE ROUTE'),('gps-weak','GPS WEAK / STALE ROUTE'),
     ('low-battery','LOW BATTERY'),('arrival','ARRIVAL'),('stale-data','NO RECENT PHONE DATA')]):
     x=(i%3)*510;y=(i//3)*550;d.text((x+24,y+12),label,fill='white')
@@ -222,7 +262,7 @@ for i,(name,label) in enumerate([
 d.text((20,1630),'Production renderer / SAMPLE data. Each round display is 466 x 466 pixels. Hardware test still required.',fill='white')
 ux.save(OUT/'ride-experience.png')
 recovery=Image.new('RGB',(1530,570),'#111719');d=ImageDraw.Draw(recovery)
-for i,(name,label) in enumerate([('turn-left-on','MEDIUM LEFT-SIDE TURN ALERT / MAP VISIBLE'),('off-route-recalculating','CONFIRMED OFF ROUTE / RECALCULATING'),('off-route-retrying','REQUEST FAILED / ALERT RETAINED')]):
+for i,(name,label) in enumerate([('turn-left','STEADY LEFT TURN / MAP VISIBLE'),('off-route-recalculating','CONFIRMED OFF ROUTE / RECALCULATING'),('off-route-retrying','REQUEST FAILED / ALERT RETAINED')]):
     d.text((i*510+15,12),label,fill='white');recovery.paste(Image.open(OUT/(name+'.png')),(i*510,35))
 d.text((15,550),'Production C renderer / SAMPLE telemetry. Physical board and live navigation still need testing.',fill='white')
 recovery.save(OUT/'left-alert-rerouting.png')
@@ -232,11 +272,6 @@ for i,(name,label) in enumerate([('u-turn','U-TURN / CURRENT IMPLEMENTATION'),('
     guide.paste(Image.open(OUT/(name+'.png')),(i*510,35))
 d.text((15,550),'Production C renderer, SAMPLE route. Flyover-specific instructions/road level are not implemented.',fill='white')
 guide.save(OUT/'u-turn-flyover-current.png')
-for side in ['left','right']:
-    frames=[Image.open(OUT/f'turn-{side}-{phase}.png') for phase in ['on','off']]
-    frames[0].save(OUT/f'turn-{side}-blink.gif',save_all=True,append_images=frames[1:],duration=500,loop=0)
-    native=[Image.open(OUT/f'turn-{side}-{phase}-native.png') for phase in ['on','off']]
-    native[0].save(OUT/f'turn-{side}-blink-466.gif',save_all=True,append_images=native[1:],duration=500,loop=0)
 if args.reference:
     reference=Image.open(args.reference).convert('RGB')
     comparison=Image.new('RGB',(1040,570),'#111719');d=ImageDraw.Draw(comparison)
@@ -253,3 +288,30 @@ if (OUT/'navigation-before.png').exists():
     comparison.paste(Image.open(OUT/'navigation.png'),(510,35))
     comparison.save(OUT/'before-after.png')
 print('Production UI captures and coordinate/report checks passed:',OUT/'screens.png')
+
+
+# A single reproducible review sheet for every production screen.
+review=Image.new('RGB',(1530,1650),'#111719');draw=ImageDraw.Draw(review)
+cases=[('navigation','NAVIGATION / LIVE GPS SPEED'),('music','MUSIC / SMALLER ARTIST'),('call','STANDARD ANSWER ICON'),
+       ('clock','HOME / TIME + DATE + DISTANCE + BATTERY'),('splash','SPLASH'),('arrival','ARRIVAL'),
+       ('settings','SETTINGS'),('brightness','BRIGHTNESS'),('settings-reset','RESET CONFIRMATION')]
+for i,(name,label) in enumerate(cases):
+    x=i%3*510;y=i//3*550
+    draw.text((x+15,y+12),label,fill='white');review.paste(Image.open(OUT/(name+'.png')),(x,y+35))
+draw.text((15,1630),'Production C renderer / SAMPLE data / each panel 466 x 466. Physical hardware test pending.',fill='white')
+review.save(OUT/'rider-features.png')
+if args.reference_dir:
+    comparison=Image.new('RGB',(1060,1670),'#111719');draw=ImageDraw.Draw(comparison)
+    pairs=[('device-front-nav.png',(205,174,872,851),'navigation-reference','NAVIGATION'),
+           ('device-music.png',(209,174,870,851),'music','MUSIC'),
+           ('device-caller.png',(208,140,884,831),'call','CALL')]
+    mask=Image.new('L',(466,466));ImageDraw.Draw(mask).ellipse((0,0,465,465),fill=255)
+    for i,(file,box,frame,label) in enumerate(pairs):
+        y=i*550
+        draw.text((25,y+12),label+' / REFERENCE DISPLAY CROP',fill='white')
+        draw.text((550,y+12),label+' / PRODUCTION C RENDERER',fill='white')
+        reference=Image.open(args.reference_dir/file).convert('RGB').crop(box).resize((466,466),Image.Resampling.LANCZOS)
+        comparison.paste(reference,(30,y+45),mask)
+        comparison.paste(Image.open(OUT/(frame+'.png')),(535,y+25))
+    draw.text((20,1650),'Sample data. Black route-only background selected. Red circle shows live GPS speed in km/h. Hardware test pending.',fill='white')
+    comparison.save(OUT/'reference-redesign.png')

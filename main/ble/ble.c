@@ -556,10 +556,16 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
         len -= 5;
     }
     if(rx_buf[0]==0x1C) {
-        if(len<4 || rx_buf[1]>2 || rx_buf[2]>3 || rx_buf[3]>47 || len!=(size_t)(4+rx_buf[3]))
+        if(len<4 || rx_buf[1]>2 || rx_buf[2]>3 || rx_buf[3]>47 || len<4+rx_buf[3])
             return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
-        char caller[48]={0};memcpy(caller,rx_buf+4,rx_buf[3]);
-        display_update_call(rx_buf[1],rx_buf[2],caller);return 0;
+        size_t base=4+rx_buf[3];
+        char caller[48]={0},number[25]={0};memcpy(caller,rx_buf+4,rx_buf[3]);
+        if(len!=base) {
+            if(len<base+1 || rx_buf[base]>24 || len!=base+1+rx_buf[base])
+                return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+            memcpy(number,rx_buf+base+1,rx_buf[base]);
+        }
+        display_update_call_number(rx_buf[1],rx_buf[2],caller,number);return 0;
     }
     if(rx_buf[0]==0x1d) {
         if(len!=2 || rx_buf[1]!=0)return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
@@ -571,6 +577,12 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
         if(len==2)display_set_glove_mode(rx_buf[1]!=0);
         else display_configure_rider_options(rx_buf[1]!=0,rx_buf[2]!=0,rx_buf[3]);
         return 0;
+    }
+    if(rx_buf[0]==0x21) {
+        if(len!=6 || rx_buf[1]>1)return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        uint32_t distance=0;
+        for(unsigned i=0;i<4;i++)distance|=(uint32_t)rx_buf[2+i]<<(8*i);
+        display_update_trip_stats(distance,rx_buf[1]);return 0;
     }
     if(rx_buf[0]==0x1f) {
         if(len<2 || rx_buf[1]>31 || len!=2+rx_buf[1])return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
@@ -595,12 +607,20 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
         size_t title_len = rx_buf[4];
         if (title_len > 40 || len < 6 + title_len) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
         size_t artist_len = rx_buf[5 + title_len];
-        if (artist_len > 32 || len != 6 + title_len + artist_len)
+        size_t base=6+title_len+artist_len;
+        if (artist_len > 32 || (len != base && len != base+8))
             return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
         media_state_t media = {0};
         media.state = rx_buf[1]; media.actions = rx_buf[2]; media.volume = rx_buf[3];
         memcpy(media.title, rx_buf + 5, title_len);
         memcpy(media.artist, rx_buf + 6 + title_len, artist_len);
+        if(len==base+8) {
+            for(unsigned i=0;i<4;i++) {
+                media.elapsed_seconds|=(uint32_t)rx_buf[base+i]<<(i*8);
+                media.duration_seconds|=(uint32_t)rx_buf[base+4+i]<<(i*8);
+            }
+            if(media.elapsed_seconds>media.duration_seconds)media.elapsed_seconds=media.duration_seconds;
+        }
         for (size_t i = 0; i < title_len; i++)
             if (media.title[i] < 32 || media.title[i] > 126) media.title[i] = '?';
         for (size_t i = 0; i < artist_len; i++)
@@ -961,7 +981,7 @@ static int ble_nav_status_access(uint16_t conn_handle, uint16_t attr_handle,
 {
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
 #if CONFIG_JUSTRIDE_ROUND_AMOLED
-        uint8_t status_buf[37] = {1,4,7,9}; // Options, chip, security flags, running version.
+        uint8_t status_buf[37] = {1,5,7,9}; // Options, chip, security flags, running version.
 #if CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT || CONFIG_SECURE_BOOT
         status_buf[4]=1;
 #endif

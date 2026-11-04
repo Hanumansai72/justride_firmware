@@ -148,6 +148,7 @@ void display_save_preferences(void);
 bool display_startup_healthy(void);
 bool display_ride_active(void);
 void display_set_destination(const char *name);
+void display_update_trip_stats(uint32_t distance_m,bool valid);
 
 /** Update live vehicle speed (km/h) */
 void display_set_speed(uint16_t speed_kmh);
@@ -191,6 +192,7 @@ typedef struct {
     uint8_t state, actions, volume;
     char title[41];
     char artist[33];
+    uint32_t elapsed_seconds, duration_seconds;
 } media_state_t;
 void display_update_media(const media_state_t *state);
 
@@ -208,6 +210,7 @@ void display_update_nav_context(const nav_context_t *context);
 
 /** Show the latest notification popup on the display (replaces any previous notification) */
 void display_update_call(uint8_t state,uint8_t actions,const char *caller);
+void display_update_call_number(uint8_t state,uint8_t actions,const char *caller,const char *number);
 void display_show_app_notification(const char *app,const char *title,const char *message);
 void display_show_notification(const char *title, const char *message);
 

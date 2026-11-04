@@ -12,15 +12,6 @@ static inline uint8_t ride_recovery(bool connected,bool ready,bool gps,bool rero
     if(rerouting)return RIDE_REROUTING;
     return paused?RIDE_PAUSED:RIDE_LIVE;
 }
-static inline int ride_turn_side(uint8_t direction) {
-    return direction==2 || direction==4 || direction==6 ? -1 :
-           direction==3 || direction==5 || direction==7 ? 1 : 0;
-}
-static inline bool ride_turn_alert(uint8_t direction,uint8_t maneuver_state,
-                                   uint32_t distance,uint8_t recovery) {
-    return recovery==RIDE_LIVE && maneuver_state!=5 && ride_turn_side(direction) && distance<=15;
-}
-static inline bool ride_blink_on(int64_t now_us){return (now_us/500000)%2==0;}
 static inline bool ride_sharp_warning(uint8_t direction,uint8_t state,uint32_t distance,
                                       unsigned speed,uint8_t recovery) {
     unsigned threshold=speed*6/3.6f;

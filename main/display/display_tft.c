@@ -432,6 +432,12 @@ bool tft_is_round_canvas(void) {
 
 // One reusable 5 KiB strip, not a screen framebuffer. The owning task draws
 // complete pixels into RAM; other SPI clients remain behind the recursive lock.
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+#include "hud_ui.h"
+static unsigned round_text_size(uint8_t scale) {
+    return scale<=1?12:scale==2?20:scale==3?32:38;
+}
+#endif
 static DMA_ATTR uint8_t s_hud_strip[320*8*2];
 static struct { int x,y,w,h; TaskHandle_t owner; } s_tile;
 static bool tile_active(void) {
@@ -1009,6 +1015,11 @@ void tft_draw_turn_arrow(int cx, int cy, int size, nav_direction_t direction, ui
 // =============================================================================
 
 void tft_draw_char(int x, int y, char c, uint16_t fg_color, uint16_t bg_color, uint8_t scale) {
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    char value[2]={c,0};
+    hud_text(x,y,value,round_text_size(scale),fg_color,bg_color,s_width-x);
+    return;
+#endif
     if (c < 32 || c > 126) c = ' ';
     int font_idx = c - 32;
 
@@ -1045,6 +1056,10 @@ void tft_draw_char(int x, int y, char c, uint16_t fg_color, uint16_t bg_color, u
 }
 
 void tft_draw_string(int x, int y, const char *str, uint16_t fg_color, uint16_t bg_color, uint8_t scale) {
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    hud_text(x,y,str,round_text_size(scale),fg_color,bg_color,s_width-x);
+    return;
+#endif
     while (*str) {
         tft_draw_char(x, y, *str, fg_color, bg_color, scale);
         x += 6 * scale; // 5 px font + 1 px spacing
@@ -1053,6 +1068,11 @@ void tft_draw_string(int x, int y, const char *str, uint16_t fg_color, uint16_t 
 }
 
 void tft_draw_string_centered(int x_center, int y, const char *str, uint16_t fg_color, uint16_t bg_color, uint8_t scale) {
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    hud_text(x_center-hud_text_width(str,round_text_size(scale))/2,y,str,
+        round_text_size(scale),fg_color,bg_color,s_width);
+    return;
+#endif
     int len = strlen(str);
     int total_w = len * 6 * scale;
     int x0 = x_center - (total_w / 2);

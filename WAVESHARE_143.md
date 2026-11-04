@@ -7,7 +7,7 @@ Use its built-in BLE with the existing JustRide phone app.
 
 ## Screen and behavior
 
-Navigation uses a black background, website-green (#34D399) phone-projected route, white rider
+Navigation uses a black background, green (#00EF9C) phone-projected route, white rider
 pointer, speed, left/right maneuver arrow, maneuver distance and status.
 The firmware does not generate street tiles or substitute a sample route.
 Waiting for route, GPS loss and phone disconnection remain explicit.
@@ -18,11 +18,17 @@ coordinates are mapped through the same transform.
 
 ### Riding experience
 
-- Within 15 m of a left/right maneuver, three medium **green chevrons on the left**
-  use the supplied reference silhouette. Right-turn chevrons mirror inside that
-  same left-side area. They blink 500 ms on / 500 ms off. The route and white rider
-  pointer remain visible in both phases; no large black rectangle covers the map.
-  Completed maneuvers, overview, paused or unreliable guidance do not blink.
+- Turn guidance uses a steady white direction arrow. The large chevron overlay
+  and its blink timer/redraws have been removed. The route and white rider pointer
+  stay visible. Optional phone vibration remains a separate opt-in feature.
+- Round-display text uses bundled Roboto regular/medium/bold, with reference-style
+  sizing. The bitmap reference does not identify its original font family.
+  Music artist text is smaller; call buttons use standard Material phone icons.
+- Home shows current time, day/date/year, travelled distance and battery percentage
+  without a tilde. Travel duration stays in journey history. Battery percentage is
+  still approximate; USB/unknown readings show dashes.
+- The navigation red/white circle shows live GPS speed in km/h. The compass is
+  removed. No speed-limit value is substituted for the rider's speed.
 - The lower guidance panel includes arrival clock time (24-hour `ETA HH:MM`) and
   total remaining kilometres from the phone's existing route telemetry. A valid
   phone-synchronized clock is required for ETA; unavailable values show dashes.
@@ -57,10 +63,10 @@ coordinates are mapped through the same transform.
 
 ![Riding experience — production renderer with SAMPLE data](docs/previews/ride-experience.png)
 
-[Left turn blink, native 466×466](docs/previews/turn-left-blink-466.gif) ·
-[Right turn blink, native 466×466](docs/previews/turn-right-blink-466.gif) ·
+[Steady left turn](docs/previews/turn-left.png) ·
+[Steady right turn](docs/previews/turn-right.png) ·
 [Arrival, native 466×466](docs/previews/arrival-native.png).
-![Medium left alert and rerouting states — SAMPLE telemetry](docs/previews/left-alert-rerouting.png)
+![Steady turn guidance and rerouting states — SAMPLE telemetry](docs/previews/left-alert-rerouting.png)
 The preview's outside margin is decorative; the actual panel is 466×466.
 The firmware retains its existing 320×320 logical drawing canvas and maps it
 through the production panel transform. No photograph or hardware timing is claimed.
@@ -93,7 +99,7 @@ See [current navigation limitations, actual U-turn/flyover previews and standby 
 - Swipe between the existing screens.
 - Navigation double-tap zooms in. Double-tap, keep the second press down and drag
   vertically for zoom in/out. This reuses the established five phone camera levels.
-- Tap the speed area at upper left for route overview; tap the compass to recenter.
+- Tap the ETA footer for route overview; tap the white rider pointer to recenter.
 - Call/music buttons send the existing BLE commands only when the phone reports
   that the corresponding action is available.
 - The FT3168 path accepts one valid contact. It does not claim two-finger pinch.
@@ -152,7 +158,7 @@ seconds without a valid packet and clear on disconnect.
 
 ### APK telemetry contract
 
-FF32 capability read begins `[1,4,7,9,securityFlags]` on this board, followed by a
+FF32 capability read begins `[1,5,7,9,securityFlags]` on this board, followed by a
 32-byte zero-terminated firmware version. Bit 0 of securityFlags means native
 signed-image OTA is required. Feature bit 4 advertises power telemetry; the fourth
 byte is the ESP image chip ID (9 = ESP32-S3). The original ESP32
@@ -163,6 +169,12 @@ Protocol v4 adds FF31 `[1E,glove,autoBrightness,manualPercent]` and revision-wra
 `[1F,length,UTF8destination]` (at most 31 bytes). Manual brightness emits FF32
 `[20,percent]` and disables the schedule. Next maneuver uses the existing fields.
 See [rider features, signed installation and remaining limits](RIDER_FEATURES.md).
+
+Protocol v5 retains the legacy music packet prefix and optionally appends elapsed
+and duration seconds as two LE32 values. Caller packets may append a length byte
+and at most 24 UTF-8 bytes for the number. FF31 home distance is exactly
+`[21,valid,distanceLE32]` (six bytes; opcode in hex). The phone gates these
+extensions on v5 capability. Time continues to use the existing synchronization.
 
 Write `[0x1D,0]` to FF31 to request power. FF32 notifies ten bytes:
 `[1D,1,flags,source,charge,percent,VCClo,VCChi,BATlo,BAThi]`.
