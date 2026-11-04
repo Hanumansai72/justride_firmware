@@ -235,7 +235,6 @@ Windows host checks need Python with Pillow and MSVC Build Tools:
 
 ```powershell
 python tools/test_waveshare143.py
-python tools/preview_round.py
 python tools/test_touch.py
 python tools/test_zoom.py
 ```
@@ -245,8 +244,9 @@ I/O. It checks both panel offsets, fragmented writes, DMA alignment, dirty-row
 suppression, image-pane mapping, touch release and I2C failure handling.
 It also checks stock divider conversion, USB/unknown behavior, monotonic battery
 estimates, exact power packets and gravity-projected turning/integration/wrap.
-The preview tool checks round hitbox mapping, FT3168 reports, QMI8658 signed
-samples, splash animation boundaries and changing maneuver output.
+The retained previews were captured from the production C renderer before the
+one-use preview/font-generation scripts were removed. Preview validation covered
+round hitbox mapping, splash animation boundaries and changing maneuver output.
 The touch suite checks 404 driver/gesture/wake cases across four rotations.
 
 Build/tests establish source and binary consistency. A bench test is still needed

@@ -98,8 +98,9 @@ transitively and is now declared directly; unused `google_fonts` and
 ## Typography revision
 
 The round renderer uses bundled Roboto regular, medium and bold TTFs under the
-Apache-2.0 license in tools/fonts. tools/generate_round_fonts.py regenerates
-bounded 4-bit glyph masks. The original 2.8-inch glyphs are unchanged. Main
+Apache-2.0 license in tools/fonts. The generated 4-bit glyph masks are checked
+into main/display/assets; the one-use generation scripts were removed after use.
+The original 2.8-inch glyphs are unchanged. Main
 distance is 38 logical pixels, its unit 28, and instruction 20, with smaller
 fallbacks for long text; the 320 logical canvas maps to the 466×466 panel. These
 fonts approximate the reference; its original family cannot be proven from the
