@@ -54,9 +54,13 @@ static void touch_task(void *pvParam) {
     int      confirm_count  = 0;   // Debounce counter
     int      release_count  = 0;
     int      max_dx = 0, max_dy = 0;
+    bool tap_pending=false, second_tap=false, zoom_drag=false;
+    int16_t tap_x=0,tap_y=0,zoom_y=0;
+    uint32_t tap_ms=0,zoom_ms=0;
 
     while (1) {
         bool is_down = touch_get_point(&pt);
+        uint32_t now=xTaskGetTickCount()*portTICK_PERIOD_MS;
 
         switch (state) {
 
@@ -73,6 +77,11 @@ static void touch_task(void *pvParam) {
                         max_dx = 0;
                         max_dy = 0;
                         press_ms     = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                        second_tap=tap_pending && now-tap_ms<=320 &&
+                            abs(pt.x-tap_x)<=20 && abs(pt.y-tap_y)<=20 &&
+                            display_nav_touch_zoom_allowed(pt.x,pt.y);
+                        tap_pending=false;
+                        zoom_drag=false;zoom_y=pt.y;zoom_ms=now;
                         state        = GESTURE_PRESSED;
                         confirm_count = 0;
                         ESP_LOGD(TAG, "TOUCH DOWN: (%d, %d)", start_x, start_y);
@@ -90,6 +99,23 @@ static void touch_task(void *pvParam) {
                     last_y = pt.y;
                     if (abs(pt.x - start_x) > max_dx) max_dx = abs(pt.x - start_x);
                     if (abs(pt.y - start_y) > max_dy) max_dy = abs(pt.y - start_y);
+                    if(second_tap) {
+                        // Only the second press of a short map tap can claim a
+                        // vertical drag. Ordinary swipes retain their meaning.
+                        if(!display_nav_touch_zoom_allowed(start_x,start_y)) {
+                            second_tap=false;
+                            zoom_drag=true; // Consume until release, never tap a new overlay.
+                        } else if(!zoom_drag && abs(pt.x-start_x)>28 &&
+                                  abs(pt.x-start_x)>=abs(pt.y-start_y)) {
+                            second_tap=false;
+                        } else if((zoom_drag || abs(pt.y-start_y)*2>abs(pt.x-start_x)*3) &&
+                                  abs(pt.y-zoom_y)>=32 && now-zoom_ms>=120) {
+                            zoom_drag=true;
+                            display_handle_touch_event(start_x,start_y,pt.x,pt.y,
+                                pt.y<zoom_y?TOUCH_GESTURE_ZOOM_IN:TOUCH_GESTURE_ZOOM_OUT);
+                            zoom_y=pt.y;zoom_ms=now;
+                        }
+                    }
                 } else {
                     // One noisy/edge sample is not a finger release. Splitting
                     // a swipe into taps can accidentally activate controls.
@@ -104,7 +130,9 @@ static void touch_task(void *pvParam) {
                              start_x, start_y, last_x, last_y, dx, dy, (unsigned long)held_ms);
 
                     // Master Prompt §12: Require abs(dx) > abs(dy) * 1.5 to prevent diagonal drifts
-                    if (dx >= SWIPE_MIN_PX && (abs(dx) * 2 > abs(dy) * 3)) {
+                    if(zoom_drag) {
+                        // All zoom steps already emitted; no release swipe/tap.
+                    } else if (dx >= SWIPE_MIN_PX && (abs(dx) * 2 > abs(dy) * 3)) {
                         // ✅ SWIPE RIGHT (Prev App / Prev Image)
                         ESP_LOGI(TAG, "GESTURE: SWIPE RIGHT (dx=+%d)", dx);
                         display_handle_touch_event(start_x, start_y, last_x, last_y, TOUCH_GESTURE_SWIPE_RIGHT);
@@ -127,7 +155,12 @@ static void touch_task(void *pvParam) {
                     } else if (max_dx <= TAP_MAX_PX && max_dy <= TAP_MAX_PX) {
                         // ✅ TAP
                         ESP_LOGI(TAG, "GESTURE: TAP at (%d, %d)", start_x, start_y);
-                        display_handle_touch_event(start_x, start_y, start_x, start_y, TOUCH_GESTURE_TAP);
+                        bool short_tap=held_ms<=280 && max_dx<=12 && max_dy<=12;
+                        display_handle_touch_event(start_x, start_y, start_x, start_y,
+                            second_tap && short_tap?TOUCH_GESTURE_DOUBLE_TAP:TOUCH_GESTURE_TAP);
+                        tap_pending=!second_tap && short_tap &&
+                            display_nav_touch_zoom_allowed(start_x,start_y);
+                        tap_x=start_x;tap_y=start_y;tap_ms=now;
 
                     } else {
                         ESP_LOGD(TAG, "GESTURE: unclassified drag (dx=%d, dy=%d)", dx, dy);

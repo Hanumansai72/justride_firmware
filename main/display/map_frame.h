@@ -8,6 +8,7 @@
 // All functions run under display.c's recursive UI lock.
 bool map_frame_packet(const uint8_t *p, size_t len);
 void map_frame_invalidate(void);
+void map_frame_reset_session(void); // New BLE peer may restart its frame counter.
 bool map_frame_draw(bool force);
 bool map_frame_active(void);
 const char *map_frame_status(void);

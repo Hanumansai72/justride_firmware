@@ -9,9 +9,12 @@
 #include <string.h>
 
 #define FRAME_BYTES (MAP_WIDTH * MAP_HEIGHT * 2)
-static uint8_t *pixels;
+static uint8_t *pixels, *incoming_pixels;
 static bool receiving, valid, dirty, on_screen, marker_dirty;
 static uint16_t frame_id, sequence, marker_x = 99, marker_y = 97, heading;
+static uint16_t incoming_id,latest_id,incoming_w,incoming_h;
+static bool seen_id, latest_committed;
+static int64_t progress_us;
 
 static size_t offset;
 static uint32_t expected_crc;
@@ -49,8 +52,10 @@ void map_frame_invalidate(void) {
   valid = false;
   dirty = false;
   status = 0;
+  on_screen=false;marker_visible=false;seen_id=false;
 }
-bool map_frame_active(void) { return receiving || valid || on_screen; }
+bool map_frame_active(void) { return valid || on_screen; }
+void map_frame_reset_session(void) {receiving=false;seen_id=false;latest_committed=false;}
 const char *map_frame_status(void) {
   return status == 0   ? "MAP LOAD"
          : status == 2 ? "MAP ERROR"
@@ -74,28 +79,29 @@ bool map_frame_packet(const uint8_t *p, size_t len) {
     uint16_t w = u16(p + 3), h = u16(p + 5);
     if (!((w == MAP_WIDTH && h == MAP_HEIGHT) || (w == 198 && h == 194)))
       return false;
-    source_w = w;
-    source_h = h;
-    if (!pixels) {
+    // Serial arithmetic permits 65535 -> 0, but rejects delayed older starts.
+    if(seen_id && ((int16_t)(id-latest_id)<0 ||
+        (id==latest_id && latest_committed)))return false;
+    if (!incoming_pixels) {
       if (heap_caps_get_free_size(MALLOC_CAP_8BIT) < FRAME_BYTES + 32768)
         return false;
-      pixels = heap_caps_malloc(FRAME_BYTES, MALLOC_CAP_8BIT);
-      if (!pixels)
+      incoming_pixels = heap_caps_malloc(FRAME_BYTES, MALLOC_CAP_8BIT);
+      if (!incoming_pixels)
         return false;
     }
-    frame_id = id;
+    incoming_w=w;incoming_h=h;incoming_id=id;latest_id=id;seen_id=true;
+    latest_committed=false;
     sequence = 0;
     offset = 0;
     expected_crc = p[7] | ((uint32_t)p[8] << 8) | ((uint32_t)p[9] << 16) |
                    ((uint32_t)p[10] << 24);
     receiving = true;
-    valid = false;
-    dirty = false;
     status = 0;
     started = esp_timer_get_time();
+    progress_us=started;
     return true;
   case 0x15: { // DATA: id, sequence, (run length, RGB565 high, low)...
-    if (!receiving || id != frame_id || len < 8 || (len - 5) % 3)
+    if (!receiving || id != incoming_id || len < 8 || (len - 5) % 3)
       return false;
     uint16_t seq = u16(p + 3);
     // App retries identical ATT writes only. Never advance twice on retry.
@@ -110,27 +116,32 @@ bool map_frame_packet(const uint8_t *p, size_t len) {
         return false;
       expanded += p[i] * 2;
     }
-    if (offset + expanded > (size_t)source_w * source_h * 2)
+    if (offset + expanded > (size_t)incoming_w * incoming_h * 2)
       return false;
     for (size_t i = 5; i < len; i += 3)
       for (unsigned n = 0; n < p[i]; n++) {
-        pixels[offset++] = p[i + 1];
-        pixels[offset++] = p[i + 2];
+        incoming_pixels[offset++] = p[i + 1];
+        incoming_pixels[offset++] = p[i + 2];
       }
     sequence++;
     last_chunk_crc = chunk_crc;
+    progress_us=esp_timer_get_time();
     return true;
   }
   case 0x16: // COMMIT: incomplete/corrupt images never reach the display
-    if (len != 3 || !receiving || id != frame_id)
+    if(len==3 && valid && latest_committed && id==latest_id && id==frame_id)return true;
+    if (len != 3 || !receiving || id != incoming_id)
       return false;
     receiving = false;
-    if (offset != (size_t)source_w * source_h * 2 ||
-        esp_rom_crc32_le(0, pixels, offset) != expected_crc) {
+    if (offset != (size_t)incoming_w * incoming_h * 2 ||
+        esp_rom_crc32_le(0, incoming_pixels, offset) != expected_crc) {
       status = 2;
       return false;
     }
     valid = true;
+    uint8_t *old=pixels;pixels=incoming_pixels;incoming_pixels=old;
+    frame_id=incoming_id;source_w=incoming_w;source_h=incoming_h;
+    latest_committed=true;
     dirty = true;
     status = 1;
     marker_x = source_w / 2;
@@ -141,12 +152,12 @@ bool map_frame_packet(const uint8_t *p, size_t len) {
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
     return true;
   case 0x17:
-    if (len != 3 || id != frame_id)
+    if (len != 3 || id != incoming_id)
       return false;
     receiving = false;
     return true;
   case 0x18: // marker in the exact downloaded north-up Web Mercator viewport
-    if (len != 9 || !valid || receiving || id != frame_id)
+    if (len != 9 || !valid || id != frame_id)
       return false;
     if (u16(p + 3) < 11 || u16(p + 3) >= source_w - 11 || u16(p + 5) < 11 ||
         u16(p + 5) >= source_h - 11 || u16(p + 7) >= 360)
@@ -193,9 +204,10 @@ static void draw_marker(void) {
   marker_serial++;
 }
 bool map_frame_draw(bool force) {
+  if(receiving && esp_timer_get_time()-progress_us>10000000)receiving=false;
   if (force)
     on_screen = false;
-  if (receiving || !valid) {
+  if (!valid) {
     if (on_screen && marker_visible && marker_dirty) {
       restore_marker_patch();
       draw_marker();
@@ -252,7 +264,7 @@ void map_frame_restore_region(int x, int y, int w, int h) {
   int left = HUD_MAP_X + (MAP_WIDTH - source_w) / 2;
   int crop = source_h > MAP_HEIGHT ? (source_h - MAP_HEIGHT) / 2 : 0;
   tft_fill_rect(x, y, w, h, HUD_BG);
-  if (!valid || receiving)
+  if (!valid)
     return;
   for (int yy = y; yy < y + h; yy++) {
     int local_y = yy - HUD_MAP_Y;

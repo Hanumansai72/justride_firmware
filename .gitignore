@@ -5,3 +5,4 @@ sdkconfig.old
 .clangd/
 *.bin
 *.elf
+/mechanical/*.zip

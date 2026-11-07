@@ -114,6 +114,9 @@ static void driver_checks(void){
    reset();raw_x=i?3600:800;raw_y=i?3500:1200;
    int px=(int)((float)((int)raw_x-TOUCH_RAW_MIN_X)*240.0f/(TOUCH_RAW_MAX_X-TOUCH_RAW_MIN_X));
    int py=(int)((float)((int)raw_y-TOUCH_RAW_MIN_Y)*320.0f/(TOUCH_RAW_MAX_Y-TOUCH_RAW_MIN_Y));
+#if TOUCH_INVERT_RAW_X
+   px=239-px;
+#endif
    CHECK(touch_get_point(&p));
 #if DISPLAY_ROTATION==TFT_ROTATION_LANDSCAPE
    CHECK(p.x==319-py && p.y==px);
@@ -133,8 +136,10 @@ static void driver_checks(void){
 
 // Replay real main.c FSM logic using deterministic frames (20ms per poll).
 typedef uint32_t TickType_t;
-typedef enum { TOUCH_GESTURE_TAP=0,TOUCH_GESTURE_SWIPE_RIGHT,TOUCH_GESTURE_SWIPE_LEFT,TOUCH_GESTURE_SWIPE_DOWN,TOUCH_GESTURE_SWIPE_UP } touch_gesture_t;
-static touch_point_t frames[32];
+typedef enum { TOUCH_GESTURE_TAP=0,TOUCH_GESTURE_SWIPE_RIGHT,TOUCH_GESTURE_SWIPE_LEFT,TOUCH_GESTURE_SWIPE_DOWN,TOUCH_GESTURE_SWIPE_UP,TOUCH_GESTURE_DOUBLE_TAP,TOUCH_GESTURE_ZOOM_IN,TOUCH_GESTURE_ZOOM_OUT } touch_gesture_t;
+static touch_point_t frames[128];
+static bool zoom_enabled;
+static bool display_nav_touch_zoom_allowed(int16_t x,int16_t y){(void)x;(void)y;return zoom_enabled;}
 static int frame_count,frame_index,event_count,last_gesture;
 #define portTICK_PERIOD_MS 10
 #define pdMS_TO_TICKS(ms) ((ms)/portTICK_PERIOD_MS)
@@ -167,6 +172,20 @@ static void gesture_checks(void){
  frames[0]=down(100,100);frames[1]=down(160,160);replay(6,0,0);
  frames[0]=down(100,100);frames[1]=down(160,100);frames[2]=down(100,100);replay(7,0,0);
  replay(32,0,0); // 640ms synthetic idle; not a real ghost-touch trial.
+ zoom_enabled=true;
+ frames[0]=down(200,100);frames[4]=down(200,100);replay(9,2,TOUCH_GESTURE_DOUBLE_TAP);
+ frames[0]=down(200,100);frames[20]=down(200,100);replay(25,2,TOUCH_GESTURE_TAP); // Expired.
+ frames[0]=down(200,100);frames[4]=down(250,100);replay(9,2,TOUCH_GESTURE_TAP); // Too far apart.
+ frames[0]=down(200,140);frames[1]=down(200,85);replay(6,1,TOUCH_GESTURE_SWIPE_UP);
+ frames[0]=down(200,100);frames[4]=down(200,100);frames[5]=down(250,100);replay(10,2,TOUCH_GESTURE_SWIPE_RIGHT);
+ frames[0]=down(200,100);
+ for(int i=4;i<=12;i++)frames[i]=down(200,i>=10?60:100);
+ replay(17,2,TOUCH_GESTURE_ZOOM_IN); // One continuous step, no release swipe.
+ frames[0]=down(200,70);
+ for(int i=4;i<=20;i++)frames[i]=down(200,i>=16?140:i>=10?105:70);
+ replay(25,3,TOUCH_GESTURE_ZOOM_OUT); // Two bounded drag steps.
+ zoom_enabled=false;
+ frames[0]=down(200,100);frames[4]=down(200,100);replay(9,2,TOUCH_GESTURE_TAP);
 }
 __declspec(dllexport) int run_touch_tests(void){driver_checks();gesture_checks();return failures+test_assert_failures;}
 __declspec(dllexport) int check_count(void){return checks;}
@@ -179,6 +198,7 @@ harness = harness.replace('FSM_SOURCE', fsm)
 (OUT / 'driver_tests.c').write_text(harness, encoding='utf-8')
 (OUT / 'touch.h').write_text((args.source / 'touch.h').read_text(encoding='utf-8'), encoding='utf-8')
 (OUT / 'touch.c').write_text((args.source / 'touch.c').read_text(encoding='utf-8'), encoding='utf-8')
+(OUT / 'display_theme.h').write_text((args.source / 'display_theme.h').read_text(encoding='utf-8'), encoding='utf-8')
 compilers = sorted(Path('C:/Program Files (x86)/Microsoft Visual Studio').glob(
     '*/BuildTools/VC/Tools/MSVC/*/bin/Hostx64/x64/cl.exe'))
 compiler = Path(os.environ['MSVC_CL']) if 'MSVC_CL' in os.environ else (compilers[-1] if compilers else None)

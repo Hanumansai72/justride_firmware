@@ -110,3 +110,9 @@ backgrounds, emerald accents and off-white text. Traffic signs and warnings
 retain semantic colors. Rebuild/flash firmware to apply palette changes; no
 APK change is required. RGB565 quantization and LCD characteristics affect
 the exact physical color appearance.
+
+## Touch-only navigation zoom (2.8-inch)
+
+Double-tap the unobstructed map to zoom in. Tap again and hold, then drag up
+or down to adjust zoom in either direction. No zoom buttons or multitouch
+are required. Install the matching Android changes as well as the firmware.

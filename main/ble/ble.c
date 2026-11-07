@@ -825,6 +825,8 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
             memset(&seg, 0, sizeof(seg));
             seg.count = count;
             seg.is_destination_visible = (rx_buf[2] & 0x01) != 0;
+            seg.overview=(rx_buf[2]&0x20)!=0;
+            seg.camera_projected=(rx_buf[2]&0x40)!=0;
             seg.completed_segment_count = (rx_buf[2] >> 1) & 0x0f;
             if (seg.completed_segment_count >= count)
                 seg.completed_segment_count = count ? count - 1 : 0;
@@ -988,11 +990,11 @@ void ble_nav_notify_status(uint8_t status_code)
     if (om) ble_gatts_notify_custom(s_conn_handle, s_nav_status_val_handle, om);
 }
 
-void ble_nav_notify_diagnostic_packet(const uint8_t *data, uint16_t len)
+bool ble_nav_notify_diagnostic_packet(const uint8_t *data, uint16_t len)
 {
-    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || s_nav_status_val_handle == 0 || !data || len == 0) return;
+    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || s_nav_status_val_handle == 0 || !data || len == 0) return false;
     struct os_mbuf *om = ble_hs_mbuf_from_flat(data, len);
-    if (om) ble_gatts_notify_custom(s_conn_handle, s_nav_status_val_handle, om);
+    return om && ble_gatts_notify_custom(s_conn_handle, s_nav_status_val_handle, om)==0;
 }
 
 
