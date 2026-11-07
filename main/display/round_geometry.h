@@ -1,7 +1,7 @@
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
-enum { ROUND_SLIDER_X=60, ROUND_SLIDER_WIDTH=200, ROUND_SLIDER_Y=190 };
+enum { ROUND_SLIDER_X=48, ROUND_SLIDER_WIDTH=224, ROUND_SLIDER_Y=197 };
 static inline int round_slider_percent(int x) {
     if(x<=ROUND_SLIDER_X)return 0;
     if(x>=ROUND_SLIDER_X+ROUND_SLIDER_WIDTH)return 100;

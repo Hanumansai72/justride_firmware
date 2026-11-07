@@ -103,15 +103,25 @@ static QueueHandle_t s_call_queue;
 static StaticQueue_t s_call_queue_storage;
 static uint8_t s_call_queue_bytes[sizeof(call_info_t)];
 typedef struct {uint32_t distance_m;bool valid;} trip_stats_t;
+typedef struct {uint32_t distance_m,duration_s;uint16_t average_speed_tenths;bool valid;} ride_summary_t;
 static trip_stats_t s_trip_stats;
+static ride_summary_t s_ride_summary;
+static ride_summary_t s_last_ride_summary;
 static QueueHandle_t s_trip_queue;
 static StaticQueue_t s_trip_queue_storage;
 static uint8_t s_trip_queue_bytes[sizeof(trip_stats_t)];
+static QueueHandle_t s_ride_summary_queue;
+static StaticQueue_t s_ride_summary_queue_storage;
+static uint8_t s_ride_summary_queue_bytes[sizeof(ride_summary_t)];
 static bool s_home_dirty=true;
 static uint8_t s_home_battery=255;
 void display_update_trip_stats(uint32_t distance_m,bool valid) {
   trip_stats_t stats={.distance_m=distance_m,.valid=valid};
   if(s_trip_queue)xQueueOverwrite(s_trip_queue,&stats);
+}
+void display_update_ride_summary(uint32_t distance_m,uint32_t duration_s,uint16_t average_speed_tenths,bool valid) {
+  ride_summary_t summary={distance_m,duration_s,average_speed_tenths,valid};
+  if(s_ride_summary_queue)xQueueOverwrite(s_ride_summary_queue,&summary);
 }
 static char s_destination[32];
 static QueueHandle_t s_destination_queue;
@@ -331,6 +341,8 @@ static nav_hud_cache_t s_hud = {
 
 // Forward declaration of internal refreshers
 static QueueHandle_t s_nav_queue, s_media_queue, s_route_queue, s_context_queue;
+static portMUX_TYPE s_nav_request_lock=portMUX_INITIALIZER_UNLOCKED;
+static bool s_open_navigation_pending;
 static QueueHandle_t s_connection_queue, s_notification_queue, s_pairing_queue;
 static uint32_t s_pairing_passkey = UINT32_MAX;
 static int64_t s_pairing_deadline;
@@ -1106,7 +1118,11 @@ static void display_nav_render_partial(void) {
 #if CONFIG_JUSTRIDE_ROUND_AMOLED
   tft_set_round_canvas(true);
   if(model.direction==NAV_DIR_REACHED) {
-    if(first || s_notif_dirty)round_ui_arrival();
+    if(first || s_notif_dirty) {
+      if(s_ride_summary.valid)round_ui_ride_summary(s_ride_summary.distance_m,
+          s_ride_summary.duration_s,s_ride_summary.average_speed_tenths,true);
+      else round_ui_arrival();
+    }
     s_hud.is_frame_active=true;s_notif_dirty=false;return;
   }
   static uint32_t map_serial,marker_serial;
@@ -1350,6 +1366,12 @@ void display_show_user_image(void) {
 // List items: Bluetooth, Display, System, Restart Device, Reset Device
 // =============================================================================
 static void update_brightness_widgets(void) {
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+  if(s_current_screen==SCREEN_BRIGHTNESS || s_show_brightness_popup)
+    round_ui_brightness(s_brightness_pct);
+  else round_ui_settings(s_ble_connected,s_brightness_pct);
+  return;
+#endif
   char bright_val_str[8];
   snprintf(bright_val_str, sizeof(bright_val_str), "%d%%", s_brightness_pct);
   tft_fill_rect(240, 80, 50, 18, COLOR_BLACK);
@@ -1736,6 +1758,12 @@ void display_set_screen(uint8_t screen_id) {
   s_show_motion_settings = false;
 
   switch (s_current_screen) {
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+  case SCREEN_RIDE_SUMMARY:
+    round_ui_ride_summary(s_last_ride_summary.distance_m,s_last_ride_summary.duration_s,
+        s_last_ride_summary.average_speed_tenths,true);
+    break;
+#endif
   case SCREEN_HOME:
     display_show_home_screen();
     break;
@@ -1796,6 +1824,10 @@ void display_next_screen(void) {
   } else if (s_current_screen == SCREEN_PICTURE) {
     next = SCREEN_SETTINGS;
   } else if (s_current_screen == SCREEN_SETTINGS) {
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    next = SCREEN_RIDE_SUMMARY;
+  } else if (s_current_screen == SCREEN_RIDE_SUMMARY) {
+#endif
     next = SCREEN_HOME;
   } else {
     next = SCREEN_HOME;
@@ -1811,6 +1843,10 @@ void display_prev_screen(void) {
   // Reverse screen cycling order (Swipe Right):
   uint8_t prev;
   if (s_current_screen == SCREEN_HOME) {
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    prev = SCREEN_RIDE_SUMMARY;
+  } else if (s_current_screen == SCREEN_RIDE_SUMMARY) {
+#endif
     prev = SCREEN_SETTINGS;
   } else if (s_current_screen == SCREEN_SETTINGS) {
 #if CONFIG_JUSTRIDE_ROUND_AMOLED
@@ -2032,9 +2068,9 @@ static void handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x,
         int row=(ty-ROUND_SETTINGS_Y)/ROUND_SETTINGS_STEP;
         if((ty-ROUND_SETTINGS_Y)%ROUND_SETTINGS_STEP>=ROUND_ROW_H)return;
         if(row==1)display_set_screen(SCREEN_BRIGHTNESS);
-      } else if(ty>=ROUND_ACTION_Y && ty<=ROUND_ACTION_Y+36) {
-        if(tx>=60 && tx<=155)ble_disconnect_and_restart();
-        else if(tx>=165 && tx<=260){s_show_reset_confirm=true;display_show_settings_screen();}
+      } else if(ty>=ROUND_ACTION_Y && ty<ROUND_ACTION_Y+ROUND_ACTION_H) {
+        if(tx>=44 && tx<154)ble_disconnect_and_restart();
+        else if(tx>=166 && tx<276){s_show_reset_confirm=true;display_show_settings_screen();}
       }
       return;
     }
@@ -2312,14 +2348,18 @@ static void handle_touch_event(int16_t start_x, int16_t start_y, int16_t end_x,
 // HARDWARE DRIVER WRAPPERS & CALLBACKS
 // =============================================================================
 void display_set_brightness(uint8_t brightness_pct) {
+  display_touch_activity();
   if (brightness_pct > 100)
     brightness_pct = 100;
   s_brightness_pct = brightness_pct;
   s_auto_brightness=false;s_manual_brightness=brightness_pct;s_options_revision++;
   uint8_t packet[]={0x20,brightness_pct};ble_nav_notify_diagnostic_packet(packet,sizeof(packet));
   tft_set_backlight(s_brightness_pct);
-  if (s_is_initialized && s_current_screen == SCREEN_SETTINGS) {
+  if (s_is_initialized && (s_current_screen == SCREEN_SETTINGS ||
+      s_current_screen == SCREEN_BRIGHTNESS)) {
+    xSemaphoreTakeRecursive(s_display_mutex, portMAX_DELAY);
     update_brightness_widgets();
+    xSemaphoreGiveRecursive(s_display_mutex);
   }
 }
 
@@ -2369,6 +2409,8 @@ static void nav_render_task(void *pvParam) {
 #else
           tft_set_backlight(target);
 #endif
+          if(s_current_screen==SCREEN_SETTINGS || s_current_screen==SCREEN_BRIGHTNESS)
+            update_brightness_widgets();
         }
       }
       static bool glove_mode;
@@ -2408,6 +2450,15 @@ static void nav_render_task(void *pvParam) {
       if(xQueueReceive(s_trip_queue,&trip,0)==pdTRUE &&
           (trip.distance_m!=s_trip_stats.distance_m || trip.valid!=s_trip_stats.valid)) {
         s_trip_stats=trip;s_home_dirty=true;
+      }
+      ride_summary_t ride;
+      if(xQueueReceive(s_ride_summary_queue,&ride,0)==pdTRUE) {
+        s_ride_summary=ride;s_notif_dirty=true;
+        if(ride.valid)s_last_ride_summary=ride;
+        if(s_current_screen==SCREEN_RIDE_SUMMARY) {
+          s_screen_refresh=true;
+          display_set_screen(SCREEN_RIDE_SUMMARY);
+        }
       }
       navigation_data_t nav;
       if(xQueueReceive(s_destination_queue,s_destination,0)==pdTRUE)s_notif_dirty=true;
@@ -2547,6 +2598,7 @@ void display_init(void) {
   s_call_queue=xQueueCreateStatic(1,sizeof(call_info_t),s_call_queue_bytes,&s_call_queue_storage);
   s_destination_queue=xQueueCreateStatic(1,32,s_destination_queue_bytes,&s_destination_queue_storage);
   s_trip_queue=xQueueCreateStatic(1,sizeof(trip_stats_t),s_trip_queue_bytes,&s_trip_queue_storage);
+  s_ride_summary_queue=xQueueCreateStatic(1,sizeof(ride_summary_t),s_ride_summary_queue_bytes,&s_ride_summary_queue_storage);
   s_nav_queue = xQueueCreateStatic(1, sizeof(navigation_data_t), s_nav_queue_bytes, &s_nav_queue_storage);
   s_media_queue = xQueueCreateStatic(1, sizeof(media_state_t), s_media_queue_bytes, &s_media_queue_storage);
   s_route_queue = xQueueCreateStatic(1, sizeof(route_segment_t), s_route_queue_bytes, &s_route_queue_storage);
@@ -2554,7 +2606,7 @@ void display_init(void) {
   s_connection_queue = xQueueCreateStatic(1, sizeof(bool), s_connection_queue_bytes, &s_connection_queue_storage);
   s_notification_queue = xQueueCreateStatic(1, sizeof(notification_info_t), s_notification_queue_bytes, &s_notification_queue_storage);
   configASSERT(s_display_mutex && s_nav_queue && s_media_queue && s_route_queue &&
-      s_context_queue && s_connection_queue && s_notification_queue && s_call_queue && s_destination_queue && s_trip_queue);
+      s_context_queue && s_connection_queue && s_notification_queue && s_call_queue && s_destination_queue && s_trip_queue && s_ride_summary_queue);
   ESP_ERROR_CHECK(tft_init());
   ESP_ERROR_CHECK(touch_init());
 
@@ -2647,7 +2699,13 @@ void display_set_imu_heading(float heading_deg) {
 
 
 void display_update_navigation(const navigation_data_t *nav_data) {
-  if (s_nav_queue && nav_data) xQueueOverwrite(s_nav_queue, nav_data);
+  if (s_nav_queue && nav_data) {
+    portENTER_CRITICAL(&s_nav_request_lock);
+    if(!nav_data->is_navigating)s_open_navigation_pending=false;
+    else if(nav_data->open_navigation)s_open_navigation_pending=true;
+    xQueueOverwrite(s_nav_queue, nav_data);
+    portEXIT_CRITICAL(&s_nav_request_lock);
+  }
 }
 
 static void apply_navigation(const navigation_data_t *nav_data) {
@@ -2667,6 +2725,10 @@ static void apply_navigation(const navigation_data_t *nav_data) {
   if (!s_phone_state_ready) s_route_seg_dirty = true;
   s_phone_state_ready = true;
   navigation_data_t filtered = *nav_data;
+  portENTER_CRITICAL(&s_nav_request_lock);
+  filtered.open_navigation |= s_open_navigation_pending;
+  s_open_navigation_pending=false;
+  portEXIT_CRITICAL(&s_nav_request_lock);
   if (filtered.speed_kmh < 3)
     filtered.speed_kmh = 0;
 
@@ -2687,7 +2749,11 @@ static void apply_navigation(const navigation_data_t *nav_data) {
   }
   if (filtered.is_navigating) s_arrival_started_us = 0;
   bool entering = !s_nav.is_navigating && filtered.is_navigating;
-  if (entering) mpu6500_begin_ride_calibration();
+  if (entering) {
+    s_ride_summary=(ride_summary_t){0};
+    if(s_ride_summary_queue)xQueueReset(s_ride_summary_queue);
+    mpu6500_begin_ride_calibration();
+  }
   if (!filtered.is_navigating && s_nav.is_navigating) {
     mpu6500_end_ride_calibration();
   }
@@ -2715,7 +2781,7 @@ static void apply_navigation(const navigation_data_t *nav_data) {
     memcpy(&s_nav, &filtered, sizeof(navigation_data_t));
     s_speed_kmh = filtered.speed_kmh;
   }
-  if ((entering || critical_turn || arriving) && s_current_screen != SCREEN_OTA) {
+  if ((entering || filtered.open_navigation || critical_turn || arriving) && s_current_screen != SCREEN_OTA) {
     s_current_screen = SCREEN_NAV;
     s_hud.is_frame_active = false;
   }

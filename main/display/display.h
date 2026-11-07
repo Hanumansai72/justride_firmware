@@ -68,6 +68,7 @@ typedef struct {
     uint16_t speed_kmh;           // Live vehicle speed (km/h)
     uint16_t heading_deg;         // Vehicle heading in degrees (0..359)
     bool is_navigating;           // Active turn-by-turn guidance flag
+    bool open_navigation;        // Explicit start/resume requests the route screen
     bool gps_available;           // Satellite lock validity
     bool rerouting;               // Route recalculation flag
     uint16_t maneuver_id;         // Unique identifier for current maneuver
@@ -105,6 +106,7 @@ typedef enum {
     SCREEN_BRIGHTNESS,
     SCREEN_OTA,
     SCREEN_MUSIC,
+    SCREEN_RIDE_SUMMARY,
     SCREEN_COUNT
 } screen_id_t;
 
@@ -147,6 +149,8 @@ bool display_startup_healthy(void);
 bool display_ride_active(void);
 void display_set_destination(const char *name);
 void display_update_trip_stats(uint32_t distance_m,bool valid);
+void display_update_ride_summary(uint32_t distance_m,uint32_t duration_s,
+                                 uint16_t average_speed_tenths,bool valid);
 
 /** Update live vehicle speed (km/h) */
 void display_set_speed(uint16_t speed_kmh);

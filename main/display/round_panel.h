@@ -17,3 +17,6 @@ bool round_panel_is_round(void);
 void round_panel_window(int x, int y, int w, int h);
 void round_panel_pixels(const uint8_t *data, size_t length);
 bool round_panel_touch(int raw_x, int raw_y, int16_t *x, int16_t *y);
+
+// Native bitmap drawing for static branding; no image upload service.
+void round_panel_blit_rle(int x,int y,int width,int height,const uint16_t *runs,size_t pairs);
