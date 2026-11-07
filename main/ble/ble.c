@@ -8,6 +8,7 @@
 #include "esp_system.h"
 #include "esp_random.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
@@ -215,7 +216,7 @@ void ble_disconnect_and_restart(void)
         vTaskDelay(pdMS_TO_TICKS(150));
     }
 
-    display_set_brightness(0);
+    tft_set_backlight(0);
     vTaskDelay(pdMS_TO_TICKS(50));
 
     ESP_LOGI(TAG, "Rebooting ESP32...");
@@ -656,6 +657,16 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
         for(unsigned i=0;i<4;i++)distance|=(uint32_t)rx_buf[2+i]<<(8*i);
         display_update_trip_stats(distance,rx_buf[1]);return 0;
     }
+    if(rx_buf[0]==0x22) {
+        if(len!=12 || rx_buf[1]>1)return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        uint32_t distance=0,duration=0;
+        for(unsigned i=0;i<4;i++) {
+            distance|=(uint32_t)rx_buf[2+i]<<(8*i);
+            duration|=(uint32_t)rx_buf[6+i]<<(8*i);
+        }
+        uint16_t speed=(uint16_t)rx_buf[10]|((uint16_t)rx_buf[11]<<8);
+        display_update_ride_summary(distance,duration,speed,rx_buf[1]);return 0;
+    }
     if(rx_buf[0]==0x1f) {
         if(len<2 || rx_buf[1]>31 || len!=2+rx_buf[1])return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
         char name[32]={0};memcpy(name,rx_buf+2,rx_buf[1]);display_set_destination(name);return 0;
@@ -834,6 +845,9 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
         } else if (op == NAV_OP_RESET) {
             ESP_LOGW(TAG, "BLE Remote: Factory Reset requested from App");
             display_set_brightness(70);
+            display_configure_rider_options(false,false,70);
+            display_set_sleep_minutes(5);
+            display_save_preferences();
             display_nav_recenter();
             display_set_screen(SCREEN_HOME);
             return 0;
@@ -996,6 +1010,8 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
         nav_data.remaining_duration_seconds=rem_dur;
         nav_data.trip_data_valid=true;
         nav_data.is_navigating = is_nav && (opcode != NAV_OP_ARRIVED);
+        nav_data.open_navigation = nav_data.is_navigating &&
+            (opcode == NAV_OP_START || opcode == NAV_OP_SYNC);
         nav_data.gps_available = gps_ok;
         nav_data.rerouting = is_reroute;
 
@@ -1096,6 +1112,24 @@ bool ble_nav_notify_diagnostic_packet(const uint8_t *data, uint16_t len)
 // GATT SERVICES DEFINITION TABLE
 // =============================================================================
 
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+static int setup_credential_access(uint16_t conn_handle,uint16_t attr_handle,
+    struct ble_gatt_access_ctxt *ctxt,void *arg) {
+    if(!ble_peer_authenticated(conn_handle))return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+    if(ctxt->op!=BLE_GATT_ACCESS_OP_READ_CHR)return BLE_ATT_ERR_UNLIKELY;
+    if(nvs_flash_init_partition("jr_factory")!=ESP_OK)return BLE_ATT_ERR_UNLIKELY;
+    nvs_handle_t handle;
+    if(nvs_open_from_partition("jr_factory","link",NVS_READONLY,&handle)!=ESP_OK)
+        return BLE_ATT_ERR_UNLIKELY;
+    char code[33]={0};size_t length=sizeof(code);
+    esp_err_t result=nvs_get_str(handle,"setup",code,&length);
+    nvs_close(handle);
+    if(result!=ESP_OK || length!=33)return BLE_ATT_ERR_UNLIKELY;
+    int rc=os_mbuf_append(ctxt->om,code,32);
+    memset(code,0,sizeof(code));
+    return rc==0?0:BLE_ATT_ERR_INSUFFICIENT_RES;
+}
+#endif
 static const struct ble_gatt_svc_def gatt_svcs[] = {
 #if CONFIG_JUSTRIDE_ROUND_AMOLED
     // Presence advertises secure pairing support; reading the version requires
@@ -1107,6 +1141,9 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
             { .uuid = BLE_UUID16_DECLARE(0xFF41),
               .flags = BLE_GATT_CHR_F_READ | SECURE_READ,
               .access_cb = ble_nav_status_access },
+            { .uuid = BLE_UUID16_DECLARE(0xFF42),
+              .flags = BLE_GATT_CHR_F_READ | SECURE_READ,
+              .access_cb = setup_credential_access },
             { 0 }
         },
     },
