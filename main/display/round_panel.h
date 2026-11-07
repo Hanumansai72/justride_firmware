@@ -4,8 +4,8 @@
 #include <stdint.h>
 #include "esp_err.h"
 
-// Navigation/home/media use a 320-square canvas, expanded to 466-square.
-// Existing auxiliary screens keep their 320x240 hitboxes in an inscribed pane.
+// All round-board screens use a 320-square canvas expanded to 466-square.
+// Controls stay inside the circular edge; legacy mapping remains for tests.
 #define ROUND_UI_SIZE 320
 #define ROUND_PANEL_SIZE 466
 esp_err_t round_panel_init(void);

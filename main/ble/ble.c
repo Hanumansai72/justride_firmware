@@ -6,6 +6,7 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_system.h"
+#include "esp_random.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -17,6 +18,7 @@
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
+#include "host/ble_store.h"
 #include "host/util/util.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
@@ -29,10 +31,32 @@
 #include "rtc_time.h"
 #include "ota.h"
 #include "display.h"
+#include "photo_format.h"
 #include "mpu6500.h"
 #include "device_power.h"
 
 static const char *TAG = "BLE";
+
+// Keep the original 2.8-inch protocol unchanged. The round board requires
+// authenticated encryption on every application characteristic.
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+#if !CONFIG_BT_NIMBLE_NVS_PERSIST || CONFIG_BT_NIMBLE_SM_LVL < 3 || !CONFIG_BT_NIMBLE_SM_SC_ONLY
+#error "Round-board pairing requires persistent bonds and authenticated Secure Connections"
+#endif
+#define SECURE_READ BLE_GATT_CHR_F_READ_AUTHEN
+#define SECURE_WRITE BLE_GATT_CHR_F_WRITE_AUTHEN
+void ble_store_config_init(void);
+static bool ble_peer_authenticated(uint16_t handle)
+{
+    struct ble_gap_conn_desc peer;
+    return ble_gap_conn_find(handle, &peer) == 0 &&
+        peer.sec_state.encrypted && peer.sec_state.authenticated && peer.sec_state.bonded;
+}
+#else
+#define SECURE_READ 0
+#define SECURE_WRITE 0
+static bool ble_peer_authenticated(uint16_t handle) { (void)handle; return true; }
+#endif
 
 // The advertised BLE device name for the motorcycle unit
 #define BLE_DEVICE_NAME "JUSTRIDE"
@@ -100,7 +124,9 @@ static const char *TAG = "BLE";
 // Connection state tracking
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t s_ota_status_val_handle = 0;
+#if !CONFIG_JUSTRIDE_ROUND_AMOLED
 static uint16_t s_img_status_val_handle = 0;
+#endif
 static uint16_t s_nav_status_val_handle = 0;
 static bool s_is_connected = false;
 static uint8_t s_ota_last_reported_pct = 0;
@@ -115,26 +141,44 @@ bool ble_startup_healthy(void){return ble_hs_synced()!=0 && s_nav_status_val_han
 
 static uint8_t s_own_addr_type;
 static TimerHandle_t s_adv_timer = NULL;
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+static TimerHandle_t s_auth_timer;
+static void ble_auth_timeout(TimerHandle_t timer)
+{
+    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE && !ble_peer_authenticated(s_conn_handle))
+        ble_gap_terminate(s_conn_handle, BLE_ERR_AUTH_FAIL);
+}
+#endif
 
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+#define s_img_transfer_active false
+#else
 // Image transfer state
 #define IMG_TOTAL_BYTES  (320u * 240u * 2u)   // 153 600 bytes (320x240 RGB565)
 #define IMG_CHUNK_SIZE   128u
 static uint32_t s_img_bytes_received = 0;
+static uint32_t s_img_expected_bytes=PHOTO_LEGACY_BYTES;
 static bool     s_img_transfer_active = false;
 static uint8_t s_img_status = IMG_STATUS_READY;
 
+
+#endif
 
 // Forward declarations
 static int ble_gap_event(struct ble_gap_event *event, void *arg);
 static int ble_ota_control_access(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg);
 static int ble_ota_data_access(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg);
 static int ble_ota_status_access(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg);
+#if !CONFIG_JUSTRIDE_ROUND_AMOLED
 static int ble_img_control_access(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg);
 static int ble_img_data_access(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg);
 static int ble_img_status_access(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg);
+#endif
 static uint32_t s_route_revision;
 static bool s_revision_received;
+#if !CONFIG_JUSTRIDE_ROUND_AMOLED
 static uint16_t s_img_expected_seq;
+#endif
 
 static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg);
 static int ble_nav_status_access(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg);
@@ -146,7 +190,20 @@ static int ble_nav_status_access(uint16_t conn_handle, uint16_t attr_handle, str
 
 bool ble_is_connected(void)
 {
-    return s_is_connected;
+    return s_is_connected && ble_peer_authenticated(s_conn_handle);
+}
+
+void ble_forget_bonds(void)
+{
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    // Only the local, physically confirmed Reset action calls this.
+    if (ble_store_clear() != 0) {
+        ESP_LOGE(TAG, "Could not clear Bluetooth bonds");
+        return;
+    }
+    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE)
+        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+#endif
 }
 
 void ble_disconnect_and_restart(void)
@@ -168,7 +225,7 @@ void ble_disconnect_and_restart(void)
 // Helper: Notify mobile app of OTA status/progress
 static void ble_ota_notify_status(uint8_t status_code, uint8_t progress_pct)
 {
-    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || s_ota_status_val_handle == 0) return;
+    if (!ble_peer_authenticated(s_conn_handle) || s_conn_handle == BLE_HS_CONN_HANDLE_NONE || s_ota_status_val_handle == 0) return;
 
     uint8_t notify_buf[4] = { status_code, progress_pct, 0, 0 };
     struct os_mbuf *om = ble_hs_mbuf_from_flat(notify_buf, sizeof(notify_buf));
@@ -184,6 +241,7 @@ static void ble_ota_notify_status(uint8_t status_code, uint8_t progress_pct)
 static int ble_time_chr_access(uint16_t conn_handle, uint16_t attr_handle,
                                struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
+    if (!ble_peer_authenticated(conn_handle)) return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
         uint8_t buf[32] = {0};
         uint16_t copied_len = 0;
@@ -264,6 +322,7 @@ static int ble_time_chr_access(uint16_t conn_handle, uint16_t attr_handle,
 static int ble_ota_control_access(uint16_t conn_handle, uint16_t attr_handle,
                                   struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
+    if (!ble_peer_authenticated(conn_handle)) return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
     if(ctxt->op!=BLE_GATT_ACCESS_OP_WRITE_CHR)return BLE_ATT_ERR_UNLIKELY;
     uint8_t packet[5];uint16_t len=0;
     if(ble_hs_mbuf_to_flat(ctxt->om,packet,sizeof(packet),&len)!=0 || !len)
@@ -284,6 +343,7 @@ static int ble_ota_control_access(uint16_t conn_handle, uint16_t attr_handle,
 static int ble_ota_data_access(uint16_t conn_handle, uint16_t attr_handle,
                                struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
+    if (!ble_peer_authenticated(conn_handle)) return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
     if(ctxt->op!=BLE_GATT_ACCESS_OP_WRITE_CHR)return BLE_ATT_ERR_UNLIKELY;
     if(ota_get_status()!=OTA_STATUS_READY && ota_get_status()!=OTA_STATUS_RECEIVING)return BLE_ATT_ERR_UNLIKELY;
     uint8_t bytes[512];uint16_t len=0;
@@ -342,6 +402,7 @@ void ble_process_ota(void) {
 static int ble_ota_status_access(uint16_t conn_handle, uint16_t attr_handle,
                                  struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
+    if (!ble_peer_authenticated(conn_handle)) return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
         uint8_t status_buf[4] = {
             (uint8_t)ota_get_status(),
@@ -359,10 +420,11 @@ static int ble_ota_status_access(uint16_t conn_handle, uint16_t attr_handle,
 // IMAGE TRANSFER SERVICE CALLBACKS (0xFF20)
 // =============================================================================
 
+#if !CONFIG_JUSTRIDE_ROUND_AMOLED
 static void ble_img_notify_status(uint8_t status_code, uint8_t progress_pct)
 {
     s_img_status = status_code;
-    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || s_img_status_val_handle == 0) return;
+    if (!ble_peer_authenticated(s_conn_handle) || s_conn_handle == BLE_HS_CONN_HANDLE_NONE || s_img_status_val_handle == 0) return;
     uint8_t buf[2] = { status_code, progress_pct };
     struct os_mbuf *om = ble_hs_mbuf_from_flat(buf, sizeof(buf));
     if (om) ble_gatts_notify_custom(s_conn_handle, s_img_status_val_handle, om);
@@ -372,6 +434,7 @@ static void ble_img_notify_status(uint8_t status_code, uint8_t progress_pct)
 static int ble_img_control_access(uint16_t conn_handle, uint16_t attr_handle,
                                   struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
+    if (!ble_peer_authenticated(conn_handle)) return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
     if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_UNLIKELY;
 
     uint8_t cmd_buf[8] = {0};
@@ -389,7 +452,7 @@ static int ble_img_control_access(uint16_t conn_handle, uint16_t attr_handle,
               | ((uint32_t)cmd_buf[3] << 16) | ((uint32_t)cmd_buf[4] << 24))
             : IMG_TOTAL_BYTES;
 
-        if (image_size != IMG_TOTAL_BYTES) {
+        if (!photo_size_valid(image_size)) {
             ESP_LOGW(TAG, "IMG: unexpected size %" PRIu32 " (expected %u)", image_size, (unsigned)IMG_TOTAL_BYTES);
             ble_img_notify_status(IMG_STATUS_ERROR_SIZE, 0);
             return 0;
@@ -400,7 +463,8 @@ static int ble_img_control_access(uint16_t conn_handle, uint16_t attr_handle,
         s_img_expected_seq = 0;
         s_img_bytes_received  = 0;
         s_img_transfer_active = true;
-        if (!display_start_image_stream()) {
+        s_img_expected_bytes=image_size;
+        if (!display_start_image_stream(image_size)) {
             s_img_transfer_active = false;
             ble_img_notify_status(IMG_STATUS_ERROR_ABORTED, 0);
             return BLE_ATT_ERR_UNLIKELY;
@@ -410,15 +474,15 @@ static int ble_img_control_access(uint16_t conn_handle, uint16_t attr_handle,
         return 0;
     }
     case IMG_CMD_FINISH: {
-        if (!s_img_transfer_active || s_img_bytes_received != IMG_TOTAL_BYTES) {
+        if (!s_img_transfer_active || s_img_bytes_received != s_img_expected_bytes) {
             s_img_transfer_active = false;
             ble_img_notify_status(IMG_STATUS_ERROR_SIZE, 0);
             return BLE_ATT_ERR_UNLIKELY;
         }
         s_img_transfer_active = false;
-        uint8_t pct = (uint8_t)((s_img_bytes_received * 100u) / IMG_TOTAL_BYTES);
+        uint8_t pct = (uint8_t)((s_img_bytes_received * 100u) / s_img_expected_bytes);
         ESP_LOGI(TAG, "IMG: FINISH — %" PRIu32 "/%u bytes received (%d%%)",
-                 s_img_bytes_received, (unsigned)IMG_TOTAL_BYTES, pct);
+                 s_img_bytes_received, (unsigned)s_img_expected_bytes, pct);
         if (!display_finish_image_stream()) {
             ble_img_notify_status(IMG_STATUS_ERROR_SIZE, 0);
             return BLE_ATT_ERR_UNLIKELY;
@@ -449,6 +513,7 @@ static int ble_img_control_access(uint16_t conn_handle, uint16_t attr_handle,
 static int ble_img_data_access(uint16_t conn_handle, uint16_t attr_handle,
                                struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
+    if (!ble_peer_authenticated(conn_handle)) return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
     if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_UNLIKELY;
     if (!s_img_transfer_active) return BLE_ATT_ERR_UNLIKELY;
 
@@ -463,7 +528,7 @@ static int ble_img_data_access(uint16_t conn_handle, uint16_t attr_handle,
     uint16_t seq = (uint16_t)chunk_buf[0] | ((uint16_t)chunk_buf[1] << 8);
     if (s_img_expected_seq > 0 && seq == s_img_expected_seq - 1) return 0;
     if (seq != s_img_expected_seq || (pay_len & 1) ||
-        s_img_bytes_received + pay_len > IMG_TOTAL_BYTES) return BLE_ATT_ERR_UNLIKELY;
+        s_img_bytes_received + pay_len > s_img_expected_bytes) return BLE_ATT_ERR_UNLIKELY;
     s_img_expected_seq++;
     if (!display_write_image_chunk(payload, pay_len)) {
         s_img_transfer_active = false;
@@ -474,8 +539,8 @@ static int ble_img_data_access(uint16_t conn_handle, uint16_t attr_handle,
 
     // Notify progress every ~5%
     static uint8_t last_img_pct = 0;
-    uint8_t pct = (uint8_t)((s_img_bytes_received * 100u) / IMG_TOTAL_BYTES);
-    if (pct >= last_img_pct + 5 || s_img_bytes_received >= IMG_TOTAL_BYTES) {
+    uint8_t pct = (uint8_t)((s_img_bytes_received * 100u) / s_img_expected_bytes);
+    if (pct >= last_img_pct + 5 || s_img_bytes_received >= s_img_expected_bytes) {
         last_img_pct = pct;
         ble_img_notify_status(IMG_STATUS_RECEIVING, pct);
     }
@@ -486,16 +551,19 @@ static int ble_img_data_access(uint16_t conn_handle, uint16_t attr_handle,
 static int ble_img_status_access(uint16_t conn_handle, uint16_t attr_handle,
                                  struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
+    if (!ble_peer_authenticated(conn_handle)) return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
         uint8_t buf[2] = {
             s_img_status,
-            (uint8_t)((s_img_bytes_received * 100u) / IMG_TOTAL_BYTES)
+            (uint8_t)((s_img_bytes_received * 100u) / s_img_expected_bytes)
         };
         os_mbuf_append(ctxt->om, buf, sizeof(buf));
         return 0;
     }
     return BLE_ATT_ERR_UNLIKELY;
 }
+
+#endif
 
 // =============================================================================
 // NAVIGATION SERVICE CALLBACKS (0xFF30)
@@ -529,6 +597,7 @@ static nav_direction_t ble_code_to_nav_direction(uint8_t code) {
 static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
                                struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
+    if (!ble_peer_authenticated(conn_handle)) return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
     if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_UNLIKELY;
 
     uint8_t rx_buf[256];
@@ -572,10 +641,13 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
         device_power_publish();return 0;
     }
     if(rx_buf[0]==0x1e) {
-        if((len!=2 && len!=4) || rx_buf[1]>1 || (len==4 && (rx_buf[2]>1 || rx_buf[3]>100)))
+        if((len!=2 && len!=4 && len!=5) || rx_buf[1]>1 ||
+           (len>=4 && (rx_buf[2]>1 || rx_buf[3]>100)) ||
+           (len==5 && rx_buf[4]!=0 && rx_buf[4]!=1 && rx_buf[4]!=5 && rx_buf[4]!=10))
             return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
         if(len==2)display_set_glove_mode(rx_buf[1]!=0);
         else display_configure_rider_options(rx_buf[1]!=0,rx_buf[2]!=0,rx_buf[3]);
+        if(len==5)display_set_sleep_minutes(rx_buf[4]);
         return 0;
     }
     if(rx_buf[0]==0x21) {
@@ -979,9 +1051,10 @@ static int ble_nav_data_access(uint16_t conn_handle, uint16_t attr_handle,
 static int ble_nav_status_access(uint16_t conn_handle, uint16_t attr_handle,
                                  struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
+    if (!ble_peer_authenticated(conn_handle)) return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
 #if CONFIG_JUSTRIDE_ROUND_AMOLED
-        uint8_t status_buf[37] = {1,5,7,9}; // Options, chip, security flags, running version.
+        uint8_t status_buf[37] = {1,6,7,9}; // v6: sleep timeout.
 #if CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT || CONFIG_SECURE_BOOT
         status_buf[4]=1;
 #endif
@@ -1005,7 +1078,7 @@ void ble_media_command(uint8_t command)
 
 void ble_nav_notify_status(uint8_t status_code)
 {
-    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || s_nav_status_val_handle == 0) return;
+    if (!ble_peer_authenticated(s_conn_handle) || s_conn_handle == BLE_HS_CONN_HANDLE_NONE || s_nav_status_val_handle == 0) return;
     uint8_t buf[2] = { status_code, 0 };
     struct os_mbuf *om = ble_hs_mbuf_from_flat(buf, sizeof(buf));
     if (om) ble_gatts_notify_custom(s_conn_handle, s_nav_status_val_handle, om);
@@ -1013,7 +1086,7 @@ void ble_nav_notify_status(uint8_t status_code)
 
 bool ble_nav_notify_diagnostic_packet(const uint8_t *data, uint16_t len)
 {
-    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || s_nav_status_val_handle == 0 || !data || len == 0) return false;
+    if (!ble_peer_authenticated(s_conn_handle) || s_conn_handle == BLE_HS_CONN_HANDLE_NONE || s_nav_status_val_handle == 0 || !data || len == 0) return false;
     struct os_mbuf *om = ble_hs_mbuf_from_flat(data, len);
     return om && ble_gatts_notify_custom(s_conn_handle, s_nav_status_val_handle, om)==0;
 }
@@ -1024,6 +1097,20 @@ bool ble_nav_notify_diagnostic_packet(const uint8_t *data, uint16_t len)
 // =============================================================================
 
 static const struct ble_gatt_svc_def gatt_svcs[] = {
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    // Presence advertises secure pairing support; reading the version requires
+    // the authenticated bond, so the app cannot report success prematurely.
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = BLE_UUID16_DECLARE(0xFF40),
+        .characteristics = (struct ble_gatt_chr_def[]) {
+            { .uuid = BLE_UUID16_DECLARE(0xFF41),
+              .flags = BLE_GATT_CHR_F_READ | SECURE_READ,
+              .access_cb = ble_nav_status_access },
+            { 0 }
+        },
+    },
+#endif
     // 1. Standard Current Time Service (CTS)
     {
         .type = BLE_GATT_SVC_TYPE_PRIMARY,
@@ -1031,7 +1118,7 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
         .characteristics = (struct ble_gatt_chr_def[]) {
             {
                 .uuid = BLE_UUID16_DECLARE(BLE_CHR_CURRENT_TIME_UUID16),
-                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP | SECURE_READ | SECURE_WRITE,
                 .access_cb = ble_time_chr_access,
             },
             { 0 }
@@ -1046,19 +1133,19 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
             {
                 // OTA Control
                 .uuid = BLE_UUID16_DECLARE(BLE_CHR_OTA_CONTROL_UUID16),
-                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP | SECURE_WRITE,
                 .access_cb = ble_ota_control_access,
             },
             {
                 // OTA Data (High-speed binary chunk sink)
                 .uuid = BLE_UUID16_DECLARE(BLE_CHR_OTA_DATA_UUID16),
-                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP | SECURE_WRITE,
                 .access_cb = ble_ota_data_access,
             },
             {
                 // OTA Status / Progress Notifier
                 .uuid = BLE_UUID16_DECLARE(BLE_CHR_OTA_STATUS_UUID16),
-                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY | SECURE_READ,
                 .val_handle = &s_ota_status_val_handle,
                 .access_cb = ble_ota_status_access,
             },
@@ -1066,6 +1153,7 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
         },
     },
 
+#if !CONFIG_JUSTRIDE_ROUND_AMOLED
     // 3. JustRide Image Transfer Service
     {
         .type = BLE_GATT_SVC_TYPE_PRIMARY,
@@ -1074,25 +1162,27 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
             {
                 // Image Control (START / FINISH / ABORT)
                 .uuid = BLE_UUID16_DECLARE(BLE_CHR_IMG_CONTROL_UUID16),
-                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP | SECURE_WRITE,
                 .access_cb = ble_img_control_access,
             },
             {
                 // Image Data — high-speed RGB565 chunk sink
                 .uuid = BLE_UUID16_DECLARE(BLE_CHR_IMG_DATA_UUID16),
-                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP | SECURE_WRITE,
                 .access_cb = ble_img_data_access,
             },
             {
                 // Image Status / Progress Notifier
                 .uuid = BLE_UUID16_DECLARE(BLE_CHR_IMG_STATUS_UUID16),
-                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY | SECURE_READ,
                 .val_handle = &s_img_status_val_handle,
                 .access_cb = ble_img_status_access,
             },
             { 0 }
         },
     },
+
+#endif
 
     // 4. JustRide Navigation Service (0xFF30)
     {
@@ -1102,13 +1192,13 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
             {
                 // Navigation Data (Sink for NAV_START, NAV_UPDATE, NAV_REROUTE, etc.)
                 .uuid = BLE_UUID16_DECLARE(BLE_CHR_NAV_DATA_UUID16),
-                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP | SECURE_WRITE,
                 .access_cb = ble_nav_data_access,
             },
             {
                 // Navigation Device Status / Button Action Feedback
                 .uuid = BLE_UUID16_DECLARE(BLE_CHR_NAV_STATUS_UUID16),
-                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY | SECURE_READ,
                 .val_handle = &s_nav_status_val_handle,
                 .access_cb = ble_nav_status_access,
             },
@@ -1150,10 +1240,16 @@ void ble_start_advertising(void)
     fields.uuids16 = (ble_uuid16_t[]) {
         BLE_UUID16_INIT(BLE_SVC_CURRENT_TIME_UUID16),
         BLE_UUID16_INIT(BLE_SVC_OTA_UUID16),
+#if !CONFIG_JUSTRIDE_ROUND_AMOLED
         BLE_UUID16_INIT(BLE_SVC_IMG_UUID16),
+#endif
         BLE_UUID16_INIT(BLE_SVC_NAV_UUID16)
     };
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    fields.num_uuids16 = 3;
+#else
     fields.num_uuids16 = 4;
+#endif
     fields.uuids16_is_complete = 1;
 
     int rc = ble_gap_adv_set_fields(&fields);
@@ -1209,10 +1305,13 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
             s_is_connected = true;
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+            xTimerStart(s_auth_timer, 0);
+#endif
             s_revision_received = false;
             if (s_adv_timer) xTimerStop(s_adv_timer, 0);
             ESP_LOGI(TAG, "Phone connected (conn_handle=%d)! Services online.", s_conn_handle);
-            display_set_ble_status(true);
+            display_set_ble_status(ble_peer_authenticated(s_conn_handle));
 
             // Update BLE connection parameters for resilient background link stability:
             // A longer supervision timeout tolerates brief Android pauses while
@@ -1240,9 +1339,15 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
         break;
 
     case BLE_GAP_EVENT_DISCONNECT:
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+        xTimerStop(s_auth_timer, 0);
+#endif
+        display_pairing_passkey(UINT32_MAX);
         time_save_checkpoint();
+#if !CONFIG_JUSTRIDE_ROUND_AMOLED
         if (s_img_transfer_active) s_img_status = IMG_STATUS_ERROR_ABORTED;
         s_img_transfer_active = false;
+#endif
         s_revision_received = false;
         s_is_connected = false;
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -1261,6 +1366,34 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
         }
         break;
 
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    case BLE_GAP_EVENT_PASSKEY_ACTION: {
+        if (event->passkey.params.action != BLE_SM_IOACT_DISP ||
+            display_get_current_screen() == SCREEN_NAV || display_get_current_screen() == SCREEN_OTA) {
+            ble_gap_terminate(event->passkey.conn_handle, BLE_ERR_AUTH_FAIL);
+            break;
+        }
+        struct ble_sm_io key = { .action = BLE_SM_IOACT_DISP };
+        // Rejection sampling avoids bias and generates a fresh six-digit key.
+        uint32_t random;
+        do { random = esp_random(); } while (random >= UINT32_MAX - UINT32_MAX % 1000000u);
+        key.passkey = random % 1000000u;
+        display_pairing_passkey(key.passkey);
+        if (ble_sm_inject_io(event->passkey.conn_handle, &key) != 0)
+            ble_gap_terminate(event->passkey.conn_handle, BLE_ERR_AUTH_FAIL);
+        break;
+    }
+    case BLE_GAP_EVENT_ENC_CHANGE:
+        xTimerStop(s_auth_timer, 0);
+        display_pairing_passkey(UINT32_MAX);
+        if (event->enc_change.status || !ble_peer_authenticated(event->enc_change.conn_handle))
+            ble_gap_terminate(event->enc_change.conn_handle, BLE_ERR_AUTH_FAIL);
+        else display_set_ble_status(true);
+        break;
+    case BLE_GAP_EVENT_REPEAT_PAIRING:
+        // Never let a remote request silently replace an existing trusted bond.
+        return BLE_GAP_REPEAT_PAIRING_IGNORE;
+#endif
     case BLE_GAP_EVENT_MTU:
         ESP_LOGI(TAG, "BLE MTU updated to: %d bytes", event->mtu.value);
         break;
@@ -1332,6 +1465,18 @@ void ble_init(void)
     }
 
     ble_svc_gap_device_name_set(BLE_DEVICE_NAME);
+
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    ble_hs_cfg.sm_io_cap = BLE_HS_IO_DISPLAY_ONLY;
+    ble_hs_cfg.sm_bonding = 1;
+    ble_hs_cfg.sm_mitm = 1;
+    ble_hs_cfg.sm_sc = 1;
+    ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    ble_store_config_init();
+    s_auth_timer=xTimerCreate("ble_auth",pdMS_TO_TICKS(90000),pdFALSE,NULL,ble_auth_timeout);
+    configASSERT(s_auth_timer);
+#endif
 
     ble_svc_gatt_init();
     ble_gatts_count_cfg(gatt_svcs);

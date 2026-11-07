@@ -34,6 +34,7 @@ bool ble_is_connected(void);
  *        and restart the ESP32 microcontroller.
  */
 void ble_disconnect_and_restart(void);
+void ble_forget_bonds(void);
 
 /**
  * @brief Navigation Status Codes for BLE 0xFF32 feedback

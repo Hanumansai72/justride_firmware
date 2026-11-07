@@ -26,3 +26,18 @@ static inline uint8_t ride_call_action(bool glove,int x,int y) {
     if(x>=(glove?170:175) && x<=(glove?253:243))return 1;
     return 0;
 }
+static inline uint8_t ride_music_command(uint8_t state,uint8_t actions,bool glove,int x,int y) {
+    if(state<3 || state>5)return y>=190 && y<=263?(state==1?8:7):0;
+    // Test volume first: its visible labels overlap the old playback hit row.
+    if(y>=277 && y<=310) {
+        if((actions&16) && x>=(glove?80:92) && x<=(glove?150:144))return 6;
+        if((actions&16) && x>=(glove?170:176) && x<=(glove?240:228))return 5;
+    }
+    if(y<(glove?199:205) || y>285)return 0;
+    if((actions&8) && x>=(glove?38:48) && x<=112)return 4;
+    if(x>=(glove?120:125) && x<=(glove?200:195)) {
+        uint8_t command=state==4?2:1;
+        return (actions&command)?command:0;
+    }
+    return (actions&4) && x>=208 && x<=(glove?282:272)?3:0;
+}

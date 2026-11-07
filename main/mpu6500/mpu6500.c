@@ -78,6 +78,7 @@ static float s_gyro_z_bias = 0.0f;
 static volatile float s_turn_rate;
 static volatile bool s_gyro_read_error;
 static int64_t s_last_gyro_us;
+static volatile bool s_heading_reset_requested;
 static esp_err_t read_turn_raw(float ax,float ay,float az,float *raw);
 #endif
 
@@ -98,6 +99,12 @@ static int64_t s_next_auto_calibration_us;
 
 void mpu6500_begin_ride_calibration(void) {
     if (!s_sensor_available) return;
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+    if(s_calibration_complete) {
+        s_heading_reset_requested=true; // Recenter yaw without changing the mount's zero point.
+        return;
+    }
+#endif
     s_auto_calibration = true;
     s_calibration_requested = true;
 }
@@ -258,13 +265,19 @@ static esp_err_t i2c_read_reg(uint8_t reg, uint8_t *data, size_t len) {
 }
 
 #if CONFIG_JUSTRIDE_ROUND_AMOLED
-static esp_err_t read_turn_raw(float ax,float ay,float az,float *raw) {
+static esp_err_t read_gyro_vector(int16_t g[3]) {
     uint8_t bytes[6];
     esp_err_t e=i2c_read_reg(0x3b,bytes,6);
     if(e!=ESP_OK)return e;
-    int16_t g[3]={qmi8658_s16(bytes),qmi8658_s16(bytes+2),qmi8658_s16(bytes+4)};
+    for(int i=0;i<3;i++)g[i]=qmi8658_s16(bytes+i*2);
     for(int i=0;i<3;i++)if(g[i]==INT16_MIN || g[i]==INT16_MAX)return ESP_ERR_INVALID_RESPONSE;
-    *raw=motion_turn_raw(g,ax,ay,az);return ESP_OK;
+    return ESP_OK;
+}
+static esp_err_t read_turn_raw(float ax,float ay,float az,float *raw) {
+    int16_t gyro[3];
+    esp_err_t e=read_gyro_vector(gyro);
+    if(e==ESP_OK)*raw=motion_turn_raw(gyro,ax,ay,az);
+    return e;
 }
 #endif
 
@@ -714,9 +727,10 @@ static void calibration_step(bool begin) {
               accel_sample_valid(sample[0], sample[1], sample[2]);
     bool gyro_ok;
 #if CONFIG_JUSTRIDE_ROUND_AMOLED
-    float turn=0;
-    gyro_ok=s_gyro_available && read_turn_raw(sample[0],sample[1],sample[2],&turn)==ESP_OK &&
-        fabsf(turn)<128;
+    int16_t gyro[3];
+    gyro_ok=s_gyro_available && read_gyro_vector(gyro)==ESP_OK &&
+        motion_calibration_stationary(sample,gyro);
+    float turn=gyro_ok?motion_turn_raw(gyro,sample[0],sample[1],sample[2]):0;
     sample[3]=gyro_ok?(int16_t)lroundf(turn):0;
     ok=ok && gyro_ok; // Motion/read errors reject this window; never disable a working gyro.
 #else
@@ -729,7 +743,11 @@ static void calibration_step(bool begin) {
         for (int i=0;i<4;i++) {
             if (sample[i] < lo[i]) lo[i]=sample[i];
             if (sample[i] > hi[i]) hi[i]=sample[i];
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+            if (i < 3 && (int)hi[i] - lo[i] > 256) steady=false;
+#else
             if (i < 3 && (int)hi[i] - lo[i] > 1800) steady=false;
+#endif
         }
         if (!steady) { count=0; gyro_count=0; memset(sums,0,sizeof(sums)); }
         else {
@@ -776,6 +794,13 @@ static void imu_task(void *pvParam) {
     int64_t last_publish_us=0;
     TickType_t sample_wake = xTaskGetTickCount();
     while (1) {
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+        if(s_heading_reset_requested) {
+            s_heading_reset_requested=false;
+            s_heading_deg=0;s_turn_rate=0;s_last_gyro_us=0;
+            display_set_imu_heading(0);
+        }
+#endif
         if (esp_timer_get_time()-last_publish_us >= 200000) {
             mpu6500_publish_status();
             last_publish_us=esp_timer_get_time();
@@ -853,6 +878,12 @@ static void imu_task(void *pvParam) {
                 float roll_raw = 0.0f;
                 float pitch_raw = 0.0f;
 
+#if CONFIG_JUSTRIDE_ROUND_AMOLED
+                // A nearly flat board must not switch to an in-plane heading
+                // calculation at an arbitrary 4000-LSB mounting threshold.
+                roll_raw=motion_roll(ax,ay,az)-motion_roll(s_base_ax,s_base_ay,s_base_az);
+                pitch_raw=motion_signed_degrees((atan2f(ay,az)-atan2f(s_base_ay,s_base_az))*57.295779513f);
+#else
                 if (s_is_vertical_mount) {
                     // Vertical / angled screen mount (Z axis is normal to screen)
                     // Roll: in-plane rotation
@@ -878,6 +909,7 @@ static void imu_task(void *pvParam) {
                     pitch_raw = asinf(delta_y) * (180.0f / (float)M_PI);
                 }
 
+#endif
 #if MPU6500_INVERT_ROLL
                 roll_raw = -roll_raw;
 #endif

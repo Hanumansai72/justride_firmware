@@ -19,9 +19,6 @@ typedef enum {
     TOUCH_GESTURE_SWIPE_LEFT   = 2,  ///< Finger moved right-to-left > SWIPE_MIN_PX
     TOUCH_GESTURE_SWIPE_DOWN   = 3,  ///< Finger moved top-to-bottom > SWIPE_MIN_PX
     TOUCH_GESTURE_SWIPE_UP     = 4,  ///< Finger moved bottom-to-top > SWIPE_MIN_PX
-    TOUCH_GESTURE_DOUBLE_TAP   = 5,
-    TOUCH_GESTURE_ZOOM_IN      = 6,
-    TOUCH_GESTURE_ZOOM_OUT     = 7,
 } touch_gesture_t;
 
 
@@ -144,6 +141,7 @@ void display_set_brightness(uint8_t brightness_pct);
 uint8_t display_get_brightness(void);
 void display_set_glove_mode(bool enabled);
 void display_configure_rider_options(bool glove,bool automatic,uint8_t manual);
+void display_set_sleep_minutes(uint8_t minutes);
 void display_save_preferences(void);
 bool display_startup_healthy(void);
 bool display_ride_active(void);
@@ -183,7 +181,7 @@ void display_handle_touch_event(int16_t start_x, int16_t start_y,
                                 touch_gesture_t gesture);
 // Record physical contact; true means consume this whole contact as wake-only.
 bool display_touch_activity(void);
-bool display_nav_touch_zoom_allowed(int16_t x,int16_t y);
+bool display_brightness_slider_touch(int16_t x,int16_t y);
 
 /** Update real-time clock (called by rtc_time.c) */
 void display_set_time(uint8_t hours, uint8_t minutes);
@@ -213,6 +211,8 @@ void display_update_call(uint8_t state,uint8_t actions,const char *caller);
 void display_update_call_number(uint8_t state,uint8_t actions,const char *caller,const char *number);
 void display_show_app_notification(const char *app,const char *title,const char *message);
 void display_show_notification(const char *title, const char *message);
+// UINT32_MAX clears the pairing overlay; never send the passkey over BLE/logs.
+void display_pairing_passkey(uint32_t passkey);
 
 /** Dismiss the currently active notification popup immediately */
 void display_dismiss_notification(void);
@@ -220,9 +220,7 @@ void display_dismiss_notification(void);
 /** Check whether a notification banner is currently active */
 bool display_is_notification_active(void);
 
-/** Navigation Map Camera & Zoom Controls */
-void display_nav_zoom_in(void);
-void display_nav_zoom_out(void);
+/** Navigation camera controls */
 void display_nav_recenter(void);
 void display_nav_toggle_overview(void);
 void display_nav_pan(int16_t dx, int16_t dy);
@@ -244,7 +242,7 @@ void display_clear(void);
 /**
  * @brief Prepare image storage and open Image View through the UI lock.
  */
-bool display_start_image_stream(void);
+bool display_start_image_stream(uint32_t bytes);
 
 /**
  * @brief Store RGB565 bytes in flash without touching the currently visible page.

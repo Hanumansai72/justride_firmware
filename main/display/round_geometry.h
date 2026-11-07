@@ -1,6 +1,12 @@
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
+enum { ROUND_SLIDER_X=60, ROUND_SLIDER_WIDTH=200, ROUND_SLIDER_Y=190 };
+static inline int round_slider_percent(int x) {
+    if(x<=ROUND_SLIDER_X)return 0;
+    if(x>=ROUND_SLIDER_X+ROUND_SLIDER_WIDTH)return 100;
+    return (x-ROUND_SLIDER_X)*100/ROUND_SLIDER_WIDTH;
+}
 
 // Shared by the QSPI transport, I2C touch driver and host verification.
 // 352x264 diagonal=440, inside the physical 466-pixel circle.

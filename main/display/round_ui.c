@@ -1,4 +1,5 @@
 #include "round_ui.h"
+#include "round_geometry.h"
 #ifdef HUD_CAPTURE
 #include "hud_capture_driver.h"
 #else
@@ -7,6 +8,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "splash_assets.h"
 #include "assets/call_icons.h"
 
@@ -16,10 +18,18 @@
 #define ROUTE_GREEN JR_RGB565(0x00EF9C)
 #define MUTED JR_RGB565(0xAEB6BC)
 static void text(int cx,int y,const char *s,unsigned size,uint16_t color) {
+    // Keep complete glyphs inside the circle, including near the top/bottom.
+    int dy=abs(y-160)>abs(y+(int)size-160)?abs(y-160):abs(y+(int)size-160);
+    int available=dy>=152?0:(int)(2*sqrtf(152*152-dy*dy))-2*abs(cx-160);
+    if(available>260)available=260;
+    if(available<=0)return;
     int width=hud_text_width(s,size);
-    if(width>260) {size=16;width=hud_text_width(s,size);}
-    if(width>260) {hud_text(30,y,s,size,color,BLACK,260);return;}
-    hud_text(cx-width/2,y,s,size,color,BLACK,260);
+    while(width>available && size>8) {
+        size=size>16?16:size>10?10:8;
+        width=hud_text_width(s,size);
+    }
+    if(width>available) {hud_text(cx-available/2,y,s,size,color,BLACK,available);return;}
+    hud_text(cx-width/2,y,s,size,color,BLACK,available);
 }
 static int nav_strip_y;
 static void paint_round(void (*draw)(void*),void *context) {
@@ -32,7 +42,7 @@ typedef struct {point_t a,b;bool past;} path_segment_t;
 // frame, not once per strip; keep allocations out of the navigation loop.
 static path_segment_t path[15];
 static unsigned path_count;
-static const int RIDER_X=155,RIDER_Y=207;
+static const int RIDER_X=155,RIDER_Y=195;
 static float maxf(float a,float b){return a>b?a:b;}
 static int mini(int a,int b){return a<b?a:b;}
 static int maxi(int a,int b){return a>b?a:b;}
@@ -67,7 +77,7 @@ static void prepare_route(const round_nav_t *v) {
         path[path_count++]=(path_segment_t){route_point(v,i-1),route_point(v,i),i<=v->completed};
 }
 static uint16_t shade(uint16_t c,float amount);
-static void arrow(int cx,int cy,float angle) {
+static void arrow(int cx,int cy,float angle,uint16_t color) {
     float a=angle*0.01745329252f;
     const point_t p[]={{0,-25},{-2,-24},{-20,12},{-21,16},{-19,18},
         {-16,18},{-1,9},{1,9},{16,18},{19,18},{21,16},{20,12},{2,-24}};
@@ -75,9 +85,9 @@ static void arrow(int cx,int cy,float angle) {
     float cs=cosf(a),sn=sinf(a);
     // Rasterize the rounded silhouette and bevel over the actual map. This
     // avoids the sharp flat triangle and preserves the reference's tail notch.
-    for(int y=maxi(nav_strip_y,cy-32);y<mini(nav_strip_y+8,cy+32);y++)
-    for(int x=maxi(0,cx-32);x<mini(320,cx+32);x++) {
-        float px=((x-cx)*cs+(y-cy)*sn)/1.08f,py=(-(x-cx)*sn+(y-cy)*cs)/0.82f;
+    for(int y=maxi(nav_strip_y,cy-36);y<mini(nav_strip_y+8,cy+36);y++)
+    for(int x=maxi(0,cx-36);x<mini(320,cx+36);x++) {
+        float px=((x-cx)*cs+(y-cy)*sn)/1.18f,py=(-(x-cx)*sn+(y-cy)*cs);
         bool inside=false;float nearest=10000;
         for(unsigned i=0,j=count-1;i<count;j=i++) {
             if((p[i].y>py)!=(p[j].y>py) &&
@@ -97,8 +107,7 @@ static void arrow(int cx,int cy,float angle) {
             float value=px<0?1.0f:0.95f;
             if(py>6)value=0.91f-(py-6)*0.012f;
             if(d<0.8f)value=0.80f;
-            uint16_t color=shade(WHITE,value);
-            tft_blend_pixel(x,y,color,15);
+            tft_blend_pixel(x,y,shade(color,value),15);
         }
     }
 }
@@ -121,6 +130,20 @@ static void disk(int cx,int cy,float radius,uint16_t color) {
     }
 }
 static void turn_arrow(uint8_t direction) {
+    if(direction==NAV_DIR_UTURN) {
+        // Upright stem, rounded return and downward arrowhead, as referenced.
+        stroke((point_t){70,268},(point_t){70,247},4.2f,WHITE,15);
+        point_t previous={70,247};
+        for(unsigned i=1;i<=16;i++) {
+            float angle=3.14159265f+i*(3.14159265f/16);
+            point_t next={82+12*cosf(angle),247+12*sinf(angle)};
+            stroke(previous,next,4.2f,WHITE,15);
+            previous=next;
+        }
+        stroke((point_t){94,247},(point_t){94,260},4.2f,WHITE,15);
+        tft_fill_triangle(83,258,105,258,94,273,WHITE);
+        return;
+    }
     if(direction!=4 && direction!=5) {
         tft_draw_turn_arrow(82,253,37,(nav_direction_t)direction,WHITE);return;
     }
@@ -154,7 +177,9 @@ static void draw_nav(void *context) {
     if(v->count<2)text(160,125,"WAITING FOR ROUTE",12,MUTED);
     int rider_x=RIDER_X,rider_y=RIDER_Y;
     if(v->overview && v->count){point_t p=route_point(v,0);rider_x=lroundf(p.x);rider_y=lroundf(p.y);}
-    if(live)arrow(rider_x,rider_y,v->overview?m->heading:v->tilt);
+    // Local motion remains visible without a GPS fix. Grey still marks stale
+    // guidance; the arrow never invents movement along the route.
+    arrow(rider_x,rider_y,v->tilt,live?WHITE:MUTED);
     char value[24];
     // Clear just the lower guidance area after painting the route.
     tft_fill_rect(35,230,250,80,BLACK);
@@ -178,7 +203,7 @@ static void draw_nav(void *context) {
     overlay_text(119,273,label,label_size,MUTED,185);
     if(live && v->trip_valid)snprintf(value,sizeof(value),"ETA %s  %.1f km",v->arrival_time[0]?v->arrival_time:"--:--",m->remaining_km);
     else strcpy(value,"ETA --:--   -- km");
-    text(160,295,value,10,MUTED);
+    text(160,290,value,10,MUTED);
     static const char *states[]={"","RECONNECTING","SYNCING ROUTE","GPS WEAK","OFF ROUTE","PAUSED","WAITING FOR PHONE"};
     if(!live) {
         text(160,24,states[v->recovery<=RIDE_STALE?v->recovery:RIDE_STALE],12,GREEN);
@@ -217,17 +242,21 @@ static void splash_bitmap(int x,int y,int w,int h,const uint8_t *bits,uint16_t c
 }
 static void draw_splash(void *unused) {
     (void)unused;
-    // Existing brand masks on the round canvas, with a plain black footer.
-    int x=(320-SPLASH_LOGO_JUST_WIDTH-SPLASH_LOGO_RIDE_WIDTH)/2;
+    // Use the same antialiased Roboto glyphs as the rest of the round UI.
+    int just_width=hud_text_width("just",38),ride_width=hud_text_width("ride",38);
+    int width=just_width+12+ride_width;
 #if SPLASH_SHOW_ROUTE_ICON
-    x-=17;
-    splash_bitmap(x,109,24,24,splash_logo_icon_bits,JR_PRIMARY);x+=34;
+    width+=34;
 #endif
-    splash_bitmap(x,104,SPLASH_LOGO_JUST_WIDTH,SPLASH_LOGO_JUST_HEIGHT,splash_logo_just_bits,WHITE);
-    splash_bitmap(x+SPLASH_LOGO_JUST_WIDTH,104,SPLASH_LOGO_RIDE_WIDTH,SPLASH_LOGO_RIDE_HEIGHT,splash_logo_ride_bits,JR_PRIMARY);
-    text(160,152,"M A D E  F O R  B I K E R S",10,WHITE);
+    int x=(320-width)/2;
+#if SPLASH_SHOW_ROUTE_ICON
+    splash_bitmap(x,113,24,24,splash_logo_icon_bits,JR_PRIMARY);x+=34;
+#endif
+    hud_text(x,104,"just",38,WHITE,BLACK,just_width);
+    hud_text(x+just_width+12,104,"ride",38,JR_PRIMARY,BLACK,ride_width);
+    text(160,152,"MADE FOR BIKERS",12,WHITE);
     tft_fill_round_rect(65,185,190,4,2,JR_PANEL_ALT);
-    text(160,214,"G E A R  U P .  R I D E  O N .",8,MUTED);
+    text(160,214,"GEAR UP. RIDE ON.",12,MUTED);
 }
 void round_ui_splash_progress(unsigned progress) {
     if(progress>100)progress=100;
@@ -261,7 +290,7 @@ static void draw_home(void *context) {
     const home_t *h=context;
     text(160,41,h->clock,38,WHITE);
     text(160,90,h->date,16,MUTED);
-    text(160,139,"DISTANCE TRAVELLED",12,GREEN);
+    text(160,139,"TOTAL DISTANCE",12,GREEN);
     char value[32];
     if(h->valid)snprintf(value,sizeof(value),"%.1f km",h->distance/1000.0f);
     else strcpy(value,"-- km");
@@ -292,7 +321,14 @@ void round_ui_set_glove_mode(bool enabled){glove_mode=enabled;}
 static void draw_music(void *context) {
     const music_t *m=context;
     text(160,35,"NOW PLAYING",20,GREEN);
-    text(160,78,m->title[0]?m->title:"No track selected",32,WHITE);
+    if(!m->active) {
+        text(160,105,m->status,16,WHITE);
+        text(160,145,"Enable music access in the app",12,MUTED);
+        tft_draw_round_rect(60,205,200,48,10,GREEN);
+        text(160,220,"TAP TO CONNECT",16,WHITE);
+        return;
+    }
+    text(160,78,m->title[0]?m->title:m->playing?"Music playing":"Music paused",32,WHITE);
     text(160,121,m->artist,20,MUTED);
     tft_fill_round_rect(32,173,256,6,3,JR_RGB565(0x104B3A));
     bool timed=m->active && m->duration>0;
@@ -313,8 +349,8 @@ static void draw_music(void *context) {
     disk(160,245,glove_mode?41:39,play);
     if(m->playing){tft_fill_round_rect(148,230,7,30,3,BLACK);tft_fill_round_rect(166,230,7,30,3,BLACK);}
     else tft_fill_triangle(153,230,153,260,175,245,BLACK);
-    text(118,291,"-",glove_mode?22:16,m->active&&(m->actions&16)?WHITE:JR_BORDER);
-    text(202,291,"+",glove_mode?22:16,m->active&&(m->actions&16)?WHITE:JR_BORDER);
+    text(118,278,"-",glove_mode?22:16,m->active&&(m->actions&16)?WHITE:JR_BORDER);
+    text(202,278,"+",glove_mode?22:16,m->active&&(m->actions&16)?WHITE:JR_BORDER);
 }
 void round_ui_music(const char *title,const char *artist,const char *status,bool playing,uint8_t actions,bool active,uint32_t elapsed,uint32_t duration) {
     music_t m={title,artist,status,playing,active,actions,elapsed,duration};
@@ -352,4 +388,58 @@ void round_ui_notification(const char *app,const char *sender,const char *messag
     tft_fill_round_rect(55,35,210,59,10,BLACK);tft_draw_round_rect(55,35,210,59,10,GREEN);
     hud_text(66,42,app,10,GREEN,BLACK,188);hud_text(66,56,sender,12,WHITE,BLACK,188);
     hud_text(66,74,message,10,MUTED,BLACK,188);
+}
+
+static void button(int x,int y,int w,int h,const char *label) {
+    tft_draw_round_rect(x,y,w,h,8,GREEN);
+    text(x+w/2,y+(h-16)/2,label,16,WHITE);
+}
+void round_ui_settings(bool connected,unsigned brightness) {
+    tft_fill_screen(BLACK);
+    text(160,35,"SETTINGS",20,GREEN);
+    const char *labels[]={"Bluetooth","Brightness"};
+    char percent[8];snprintf(percent,sizeof(percent),"%u%%",brightness);
+    const char *values[]={connected?"Connected":"Offline",percent};
+    for(int i=0;i<2;i++) {
+        int y=ROUND_SETTINGS_Y+i*ROUND_SETTINGS_STEP;
+        tft_draw_round_rect(ROUND_SETTINGS_X,y,ROUND_SETTINGS_W,ROUND_ROW_H,8,JR_BORDER);
+        hud_text(67,y+10,labels[i],16,WHITE,BLACK,112);
+        hud_text(188,y+12,values[i],12,i==1?GREEN:MUTED,BLACK,68);
+    }
+    button(60,ROUND_ACTION_Y,95,36,"Restart");
+    button(165,ROUND_ACTION_Y,95,36,"Reset");
+    text(160,276,"SWIPE TO CHANGE",10,MUTED);
+}
+void round_ui_brightness(unsigned brightness) {
+    tft_fill_screen(BLACK);
+    text(160,54,"BRIGHTNESS",20,GREEN);
+    char value[8];snprintf(value,sizeof(value),"%u%%",brightness);
+    text(160,105,value,38,WHITE);
+    tft_fill_round_rect(ROUND_SLIDER_X,ROUND_SLIDER_Y,ROUND_SLIDER_WIDTH,6,3,JR_BORDER);
+    if(brightness)tft_fill_round_rect(ROUND_SLIDER_X,ROUND_SLIDER_Y,brightness*ROUND_SLIDER_WIDTH/100,6,3,GREEN);
+    tft_fill_circle(ROUND_SLIDER_X+brightness*ROUND_SLIDER_WIDTH/100,ROUND_SLIDER_Y+3,10,GREEN);
+}
+void round_ui_update(unsigned progress) {
+    tft_fill_screen(BLACK);
+    text(160,62,"FIRMWARE UPDATE",20,GREEN);
+    char value[8];snprintf(value,sizeof(value),"%u%%",progress);
+    text(160,112,value,38,WHITE);
+    tft_draw_round_rect(70,180,180,16,6,JR_BORDER);
+    if(progress)tft_fill_round_rect(73,183,(int)(progress*174/100),10,4,GREEN);
+    text(160,221,progress==100?"VERIFYING FIRMWARE":"RECEIVING UPDATE",16,WHITE);
+    text(160,247,"KEEP DEVICE POWERED ON",10,MUTED);
+}
+void round_ui_reset(void) {
+    tft_fill_screen(BLACK);
+    text(160,86,"RESET DEVICE?",20,GREEN);
+    text(160,128,"Restore settings and",16,WHITE);
+    text(160,151,"clear Bluetooth pairing?",16,WHITE);
+    button(52,202,100,40,"Cancel");button(168,202,100,40,"Reset");
+}
+void round_ui_pairing(uint32_t passkey) {
+    tft_fill_screen(BLACK);
+    text(160,77,"PAIR YOUR PHONE",20,GREEN);
+    char code[7];snprintf(code,sizeof(code),"%06lu",(unsigned long)(passkey%1000000u));
+    text(160,126,code,38,WHITE);
+    text(160,195,"Enter this code on your phone",12,MUTED);
 }
